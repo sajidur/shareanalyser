@@ -284,6 +284,23 @@ button.chip.on { background: var(--accent); border-color: var(--accent); color: 
 .meter > div { position: absolute; left: 0; top: 0; bottom: 0; background: var(--s1); border-radius: 4px; }
 .ok-mark { color: var(--up); font-weight: 700; }
 .no-mark { color: var(--down); font-weight: 700; }
+.sig { display: inline-flex; align-items: center; font-size: 12px; font-weight: 750; letter-spacing: .02em; padding: 3px 10px; border-radius: 6px; background: var(--surface-3); color: var(--text-2); white-space: nowrap; }
+.sig.BUY { background: var(--up-fill); color: #fff; }
+.sig.ACCUMULATE { background: var(--up-soft); color: var(--up); }
+.sig.HOLD { background: var(--accent-soft); color: var(--accent-ink); }
+.sig.TAKE.PROFIT, .sig.TAKE_PROFIT { background: var(--warn-soft); color: var(--warn-ink); }
+.sig.SELL { background: var(--down-fill); color: #fff; }
+.sig.REDUCE { background: var(--down-soft); color: var(--down); box-shadow: inset 0 0 0 1px var(--down-fill); }
+.sig.AVOID { background: var(--down-soft); color: var(--down); }
+.sig.big { font-size: 16px; padding: 6px 14px; }
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.plan-grid .cell { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
+.plan-grid .cell .k { font-size: 11.5px; color: var(--text-2); font-weight: 600; }
+.plan-grid .cell .v { font-size: 17px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.plan-grid .cell .d { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.ai-note { font-size: 13.5px; line-height: 1.55; }
+.ai-note ul { margin: 4px 0 8px; padding-left: 18px; }
+.ai-note p { margin: 6px 0; }
 .note { padding: 10px 12px; border-radius: 8px; background: var(--surface-2); font-size: 12.5px; color: var(--text-2); }
 .note b { color: var(--text); }
 

@@ -136,6 +136,40 @@ SCHEMA = [
         KEY idx_news_code_date (code, news_date),
         KEY idx_news_date (news_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS market_events (
+        id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        event_date DATE NOT NULL,
+        kind VARCHAR(16) NOT NULL,
+        title VARCHAR(200) NOT NULL,
+        impact TINYINT NULL,
+        note VARCHAR(500) NULL,
+        created_at DATETIME NULL,
+        KEY idx_events_date (event_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS signal_log (
+        id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        signal_date DATE NOT NULL,
+        code VARCHAR(32) NOT NULL,
+        signal_type VARCHAR(16) NOT NULL,
+        close_at_signal DOUBLE NULL,
+        entry_limit DOUBLE NULL, stop DOUBLE NULL, t1 DOUBLE NULL, t2 DOUBLE NULL,
+        exit_by DATE NULL,
+        win_rate DOUBLE NULL, ev_pct DOUBLE NULL,
+        status VARCHAR(12) NOT NULL DEFAULT 'pending',
+        entry_date DATE NULL, entry_price DOUBLE NULL,
+        exit_date DATE NULL, exit_price DOUBLE NULL,
+        return_pct DOUBLE NULL, max_gain_pct DOUBLE NULL, max_loss_pct DOUBLE NULL, sessions INT NULL,
+        UNIQUE KEY uq_signal (signal_date, code, signal_type),
+        KEY idx_signal_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS ai_notes (
+        code VARCHAR(32) NOT NULL,
+        trade_date DATE NOT NULL,
+        model VARCHAR(64) NULL,
+        note MEDIUMTEXT NULL,
+        created_at DATETIME NULL,
+        PRIMARY KEY (code, trade_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS watchlist (
         code VARCHAR(32) NOT NULL PRIMARY KEY,
         note VARCHAR(255) NULL,
@@ -211,6 +245,11 @@ MIGRATIONS = [
     ("prediction_checks", "in50", "in50 DOUBLE NULL AFTER n"),
     ("prediction_checks", "width50", "width50 DOUBLE NULL AFTER bias_pct"),
     ("prediction_checks", "width68", "width68 DOUBLE NULL AFTER width50"),
+    ("news", "ai_impact", "ai_impact TINYINT NULL AFTER record_date"),
+    ("news", "ai_reason", "ai_reason VARCHAR(300) NULL AFTER ai_impact"),
+    ("news", "ai_at", "ai_at DATETIME NULL AFTER ai_reason"),
+    ("predictions", "low30", "low30 DOUBLE NULL AFTER median"),
+    ("predictions", "high30", "high30 DOUBLE NULL AFTER low30"),
 ]
 
 

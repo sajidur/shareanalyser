@@ -267,7 +267,7 @@ function errorHtml(e) {
 
 /* ------------------------------------------------------------------ router */
 const ROUTES = {
-  '': viewDashboard, market: viewMarket, stock: viewStock, screener: viewScreener, predict: viewPredict, accuracy: viewAccuracy, watchlist: viewWatchlist,
+  '': viewDashboard, market: viewMarket, stock: viewStock, screener: viewScreener, predict: viewPredict, accuracy: viewAccuracy, bd: viewBD, watchlist: viewWatchlist,
   portfolio: viewPortfolio, alerts: viewAlerts, reports: viewReports, settings: viewSettings,
 };
 const LIVE_ROUTES = new Set(['', 'market', 'watchlist', 'screener']);
@@ -328,7 +328,7 @@ function renderStatus(st) {
 function renderBanner(st) {
   const b = $('#banner');
   const jobs = st.jobs || {};
-  const local = ['backfill', 'daily', 'analyze', 'predict', 'simulate'].map(k => jobs[k]).find(j => j && j.running);
+  const local = ['backfill', 'daily', 'analyze', 'predict', 'simulate', 'ai_news'].map(k => jobs[k]).find(j => j && j.running);
   const external = st.backfill_progress && st.backfill_progress.running ? st.backfill_progress : null;
   if (local || external) {
     const p = local ? local.progress : external;
@@ -338,6 +338,7 @@ function renderBanner(st) {
       : name === 'daily' ? (p ? 'End-of-day run: filling missing price history' : 'Running end-of-day analysis')
       : name === 'predict' ? 'Training and testing the prediction model'
       : name === 'simulate' ? 'Rebuilding the walk-forward forecast history (about 2 minutes)'
+      : name === 'ai_news' ? 'Local AI is rating announcements (about 7 seconds each)'
       : 'Re-running analysis';
     b.innerHTML = `<div class="banner info"><div class="msg"><strong>${what}…</strong> ${p ? `${p.done} / ${p.total} <span class="muted">${esc(p.item || '')}</span>` : ''}</div>${pct != null ? `<div class="progress"><div style="width:${pct}%"></div></div>` : ''}</div>`;
     S.jobWasRunning = true;
@@ -953,10 +954,13 @@ function newsListHtml(items, tagLabels = {}, showCode = false) {
   return `<ul class="list-plain">${items.map(n => {
     const tone = isNum(n.tone) && n.tone !== 0 ? `<span class="chip ${n.tone > 0 ? 'pos' : 'neg'}" title="Tone score used by the model">${n.tone > 0 ? '▲ positive' : '▼ negative'}</span>` : '';
     const eps = isNum(n.eps_growth) ? `<span class="chip ${n.eps_growth > 0 ? 'pos' : n.eps_growth < 0 ? 'neg' : ''}">EPS ${fmtPct(n.eps_growth * 100, 0)} vs last year</span>` : '';
+    const ai = isNum(n.ai_impact) && (n.ai_reason || '') !== 'Routine notice'
+      ? `<span class="chip ${n.ai_impact > 0 ? 'pos' : n.ai_impact < 0 ? 'neg' : ''}" title="${esc(n.ai_reason || '')}">AI ${n.ai_impact > 0 ? '+' : ''}${n.ai_impact}</span>` : '';
     const tags = (n.tags || []).filter(t => t !== 'earnings').map(t => `<span class="chip ${NEWS_TAG_CLASS[t] || ''}">${esc(tagLabels[t] || t)}</span>`).join('');
     return `<li><div class="sp" style="align-items:flex-start"><div>${showCode ? `${stockLink(n.code)} ` : ''}<b>${esc(n.summary)}</b>
         <div class="small muted">${fmtDate(n.news_date, { day: 'numeric', month: 'short', year: 'numeric' })}${n.news_time ? ' · ' + esc(n.news_time) : ''}${n.type ? ' · ' + esc(n.type) : ''}${n.record_date ? ` · record date ${fmtDate(n.record_date, { day: 'numeric', month: 'short' })}` : ''}</div></div>
-        <div class="chips" style="justify-content:flex-end">${eps}${tone}${tags}</div></div>
+        <div class="chips" style="justify-content:flex-end">${ai}${eps}${tone}${tags}</div></div>
+      ${n.ai_reason && n.ai_reason !== 'Routine notice' ? `<div class="small muted">AI: ${esc(n.ai_reason)}</div>` : ''}
       ${n.body && n.body !== n.summary ? `<details class="small mt"><summary class="muted" style="cursor:pointer">Full text</summary><p style="white-space:pre-wrap;margin:6px 0 0">${esc(n.body)}</p></details>` : ''}</li>`;
   }).join('')}</ul>`;
 }
@@ -991,11 +995,103 @@ function reliabilityTable(hz, live) {
         <td class="r">${isNum(b.direction_accuracy) ? fmt(b.direction_accuracy, 0) + '%' : '—'}</td>
         <td class="r">${isNum(b.naive_accuracy) ? fmt(b.naive_accuracy, 0) + '%' : '—'}</td>
         <td class="r">${l.checked ? `${fmtInt(l.checked)} <span class="muted small">(range ${fmt(l.range68_hit, 0)}%, direction ${fmt(l.direction_accuracy, 0)}%)</span>` : '<span class="muted small">builds up daily</span>'}</td>
-        <td>${v.reliable ? '<span class="label b">Direction reliable</span>' : b.range68_hit >= 60 ? '<span class="label">Ranges only</span>' : '<span class="label be">Low confidence</span>'}</td></tr>`;
+        <td>${v.extrapolated ? '<span class="label">Estimate (untestable yet)</span>' : v.reliable ? '<span class="label b">Direction reliable</span>' : b.range68_hit >= 60 ? '<span class="label">Ranges only</span>' : '<span class="label be">Low confidence</span>'}</td></tr>`;
     }).join('')}</tbody></table></div>`;
 }
 
-const RANGE_NAMES = { 50: 'Most likely range', 68: 'Likely range', 90: 'Wide range' };
+const RANGE_NAMES = { 30: 'Core range', 50: 'Most likely range', 68: 'Likely range', 90: 'Wide range' };
+const sigBadge = (s, big = false) => (s ? `<span class="sig ${esc(s).replace(' ', '_')}${big ? ' big' : ''}">${esc(s)}</span>` : '');
+const SIGNAL_HELP = {
+  BUY: 'Uptrend pullback with reward:risk ≥ 1.5 and positive historical expected value',
+  ACCUMULATE: 'Quality/value share suited to buying a fixed amount regularly',
+  HOLD: 'You hold it and the trend is intact; keep the trailing stop',
+  'TAKE PROFIT': 'You hold it and it is stretched (at target / RSI > 75 / above upper band)',
+  SELL: 'You hold it: trend stop hit (not a quality share) or strong-evidence bad news such as a Z downgrade',
+  REDUCE: 'You hold it and the trend is down: consider selling part',
+  AVOID: 'Downtrend, seriously negative news or too illiquid',
+  WAIT: 'No clear setup right now',
+};
+function mdLite(text) {
+  const lines = esc(text || '').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').split(/\r?\n/);
+  let html = '', inList = false;
+  for (const raw of lines) {
+    const l = raw.trim();
+    if (/^[-*•]\s+/.test(l)) {
+      if (!inList) { html += '<ul>'; inList = true; }
+      html += `<li>${l.replace(/^[-*•]\s+/, '')}</li>`;
+    } else {
+      if (inList) { html += '</ul>'; inList = false; }
+      if (l) html += `<p>${l}</p>`;
+    }
+  }
+  return html + (inList ? '</ul>' : '');
+}
+
+function tradePlanHtml(one) {
+  const p = one.plan;
+  if (!p) return '';
+  const rec = one.buy_record || {};
+  const cell = (k, v, d = '') => `<div class="cell"><div class="k">${k}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+  const pct = x => (isNum(x) ? fmtPct(x, 1) : '');
+  const hold = p.holding;
+  const sizeCell = isNum(p.shares) && p.shares > 0
+    ? cell('Position size', `${fmtInt(p.shares)} shares`, `≈ Tk ${fmtInt(p.position_value)} · loses ≈ Tk ${fmtInt(p.risk_amount)} if stopped`)
+    : cell('Position size', '—', '<a href="#/settings">Set your capital &amp; risk % in Settings</a>');
+  const intr = one.intraday;
+  return `<div class="card"><div class="card-h"><h2>Trade plan</h2>${sigBadge(p.signal, true)}<span class="small muted">${esc(SIGNAL_HELP[p.signal] || '')}</span></div>
+    <div class="card-b">
+      <ul class="reasons" style="margin:0 0 12px">${p.reasons.map(r => `<li><span class="pts">•</span><span>${esc(r)}</span></li>`).join('')}</ul>
+      ${hold ? `<div class="note" style="margin-bottom:12px"><b>You hold ${fmtInt(hold.qty)} shares</b> at avg ${fmt(hold.avg_cost)} (${chg(hold.unrealized_pct)}). Trailing stop: <b>${fmt(hold.trailing_stop)}</b>: sell if the price closes below it.</div>` : ''}
+      ${intr ? `<div class="note" style="margin-bottom:12px"><b>Live:</b> today's close is likely <b>${fmt(intr.low50)} – ${fmt(intr.high50)}</b> (50%), almost surely ${fmt(intr.low90)} – ${fmt(intr.high90)} (90%). Price now ${fmt(intr.ltp)}, ${intr.time_left_pct}% of the session left: the range narrows as the close approaches.</div>` : ''}
+      <div class="plan-grid">
+        ${cell('Buy zone (limit)', p.buy_zone ? `${fmt(p.buy_zone[0])} – ${fmt(p.buy_zone[1])}` : '—', 'next session: ~50% / ~70% chance of a fill')}
+        ${cell('Stop-loss', `<span class="down">${fmt(p.stop)}</span>`, `${pct(p.stop_pct)} · price − 1.5 × ATR`)}
+        ${cell('Target 1 (≈1 week)', `<span class="up">${fmt(p.t1)}</span>`, `${pct(p.t1_pct)} · reward:risk 1:${fmt(p.rr1, 1)}`)}
+        ${cell('Target 2 (≈1 month)', `<span class="up">${fmt(p.t2)}</span>`, `${pct(p.t2_pct)} · reward:risk 1:${fmt(p.rr2, 1)}`)}
+        ${cell('Historical win rate', isNum(p.win_rate) ? `${fmt(p.win_rate, 0)}%` : '—', isNum(p.stop_rate) ? `T2 before stop · stop first ${fmt(p.stop_rate, 0)}% (20 sessions)` : '')}
+        ${cell('Expected value', isNum(p.ev_pct) ? `<span class="${dir(p.ev_pct)}">${fmtPct(p.ev_pct, 2)}</span>` : '—', 'average result per trade with this stop/target')}
+        ${cell('Sell zone (limit)', p.sell_zone ? `${fmt(p.sell_zone[0])} – ${fmt(p.sell_zone[1])}` : '—', 'next session: ~50% / ~30% chance price reaches it')}
+        ${cell('Support · Resistance', `${fmt(p.support)} · ${fmt(p.resistance)}`, '20-day low · 20-day high')}
+        ${sizeCell}
+      </div>
+      ${planDatesHtml(p)}
+      <p class="small muted mt">Win rate and expected value come from every liquid DSE share in the past year: how often a rise of this size (in units of the share's own volatility) came before a fall of this size. The BUY rule's own record: ${rec.trades ? `${fmtInt(rec.trades)} past trades, target first ${fmt(rec.win_rate, 0)}%, stopped ${fmt(rec.stop_rate, 0)}%, average ${fmtPct(rec.avg_trade, 2)} per trade vs ${fmtPct(rec.baseline_trade, 2)} for random entries (about ${fmt(rec.avg_days, 0)} sessions held).` : 'building up.'}</p>
+    </div></div>`;
+}
+
+function planDatesHtml(p) {
+  const d = p.dates;
+  if (!d) return '';
+  const D = x => fmtDate(x, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  const R = r => (r ? `${fmt(r[0])} – ${fmt(r[1])}` : '—');
+  const s = d.short, l = d.long;
+  return `<div class="grid g2 mt" style="gap:12px">
+    <div class="note"><b>Short-term trade · ${fmtDate(s.from, { day: 'numeric', month: 'short' })} – ${fmtDate(s.to, { day: 'numeric', month: 'short', year: 'numeric' })}</b>
+      <ul class="steps" style="margin:6px 0 0;padding-left:18px">
+        <li>Buy: next session, <b>${D(s.entry)}</b>, in the buy zone ${p.buy_zone ? `${fmt(p.buy_zone[0])} – ${fmt(p.buy_zone[1])}` : ''}; place the stop at <b>${fmt(p.stop)}</b></li>
+        <li>Target 1 <b>${fmt(p.t1)}</b> by about <b>${D(s.t1_by)}</b> (1 week; likely range ${R(s.range_1w)})</li>
+        <li>Target 2 <b>${fmt(p.t2)}</b> by about <b>${D(s.t2_by)}</b> (1 month; likely range ${R(s.range_1m)})</li>
+        <li>If neither the stop nor Target 2 is hit by <b>${D(s.exit_by)}</b>, exit or re-check the plan${s.typical_exit ? `. Past trades of this kind ended after about ${fmt(s.typical_hold_sessions, 0)} sessions (around ${D(s.typical_exit)})` : ''}</li>
+      </ul></div>
+    <div class="note"><b>Long-term (regular buying) · ${fmtDate(l.from, { month: 'short', year: 'numeric' })} – ${fmtDate(l.to, { month: 'short', year: 'numeric' })}</b>
+      <ul class="steps" style="margin:6px 0 0;padding-left:18px">
+        <li>Accumulate in equal parts from <b>${D(l.accumulate_from)}</b> to <b>${D(l.accumulate_to)}</b> (about 3 months) instead of buying all at once</li>
+        <li>3 months (${D(l.accumulate_to)}): likely ${R(l.range_3m)}</li>
+        <li>Review on <b>${D(l.review)}</b> (6 months): likely ${R(l.range_6m)} <span class="muted">(estimate)</span></li>
+        <li>1-year horizon <b>${D(l.horizon)}</b>: likely ${R(l.range_1y)}, wider ${R(l.range_1y_68)} (50% / 68%, <span class="muted">estimate</span>)</li>
+      </ul>
+      <div class="small muted mt">${p.long_score != null ? `Long-term quality/value score: <b>${fmt(p.long_score, 0)}/100</b>${p.long_score >= 70 ? ' (suited to regular buying)' : ''}.` : 'Not in the long-term universe (needs category A, profitable, liquid).'}</div></div>
+  </div>`;
+}
+
+function aiCardHtml(one) {
+  const ai = one.ai || {};
+  const n = one.ai_note;
+  return `<div class="card"><div class="card-h"><h2>AI analyst note</h2><span class="small muted">local Ollama · ${esc(ai.model || '')} · written from the numbers on this page</span>
+      <button class="btn btn-sm" id="ai-gen" ${ai.available ? '' : 'disabled'}>${n ? 'Rewrite' : 'Write note'}</button></div>
+    <div class="card-b"><div id="ai-out" class="ai-note">${n ? mdLite(n.note) + `<p class="small muted">${esc(n.model || '')} · ${fmtTime(n.created_at)}</p>` : ai.available ? '<p class="muted small">Click "Write note" for a plain-language summary (takes about 30 seconds on your PC).</p>' : `<p class="muted small">Local AI not available${ai.error ? ': ' + esc(ai.error) : ''}. Start Ollama with the ${esc(ai.model || 'gemma3:4b')} model.</p>`}</div>
+    <p class="small muted">The AI only explains; it does not make the ranges or signals. Small local models can misread facts, so check the numbers above.</p></div></div>`;
+}
 const band = (h, level) => [h['low' + level] ?? h.low68, h['high' + level] ?? h.high68];
 
 function horizonTile(h, close) {
@@ -1005,19 +1101,37 @@ function horizonTile(h, close) {
   const hit = bt[`range${lvl}_hit`];
   const weak = isNum(hit) && hit < lvl - 12;
   const others = [50, 68, 90].filter(x => x !== lvl).map(x => { const [a, b] = band(h, x); return `${x}%: ${fmt(a)} – ${fmt(b)}`; }).join(' · ');
-  const dirLine = h.reliable
-    ? `<span class="${h.prob_up >= 0.5 ? 'up' : 'down'}">${arrow(h.prob_up - 0.5)}${pct0(h.prob_up)} chance of rising</span>`
-    : '<span class="muted">Direction: no reliable signal</span>';
+  const dirLine = h.extrapolated
+    ? '<span class="muted">Estimate: 3-month range extended with √time; cannot be tested with one year of history</span>'
+    : h.reliable
+      ? `<span class="${h.prob_up >= 0.5 ? 'up' : 'down'}">${arrow(h.prob_up - 0.5)}${pct0(h.prob_up)} chance of rising</span>`
+      : '<span class="muted">Direction: no reliable signal</span>';
+  const dateFmt = h.h >= 60 ? { day: 'numeric', month: 'short', year: 'numeric' } : { weekday: 'short', day: 'numeric', month: 'short' };
   return `<div class="tile">
-    <div class="k"><span>${esc(h.label)}</span><span class="muted">${h.target_date ? fmtDate(h.target_date, { weekday: 'short', day: 'numeric', month: 'short' }) : ''}</span></div>
+    <div class="k"><span>${esc(h.label)}</span><span class="muted">${h.target_date ? fmtDate(h.target_date, dateFmt) : ''}</span></div>
     <div class="v range num">${fmt(lo)} – ${fmt(hi)}</div>
     <div class="d">${RANGE_NAMES[lvl]} (${lvl}%) · ${fromClose(lo, close)} to ${fromClose(hi, close)}</div>
-    <div class="d small">${isNum(hit) ? `Held ${fmt(hit, 0)}% of the time in tests` : ''} · midpoint ${fmt(h.median)}</div>
+    <div class="d small">${isNum(hit) ? `Held ${fmt(hit, 0)}% of the time in tests · ` : h.extrapolated ? '<span class="chip warn">Estimate</span> ' : ''}midpoint ${fmt(h.median)}</div>
     <div class="d small muted">${others}</div>
     <div class="d">${dirLine}</div>
-    <div class="d muted small">Past year: higher after ${h.h === 1 ? 'one session' : esc(h.label.toLowerCase())} ${pct0(h.hist_up)} of the time</div>
+    ${isNum(h.hist_up) ? `<div class="d muted small">Past year: higher after ${h.h === 1 ? 'one session' : esc(h.label.toLowerCase())} ${pct0(h.hist_up)} of the time</div>` : ''}
     ${weak ? `<div class="d"><span class="chip warn" title="In tests the price ended inside this ${lvl}% range only ${fmt(hit, 0)}% of the time">Low confidence</span></div>` : ''}
   </div>`;
+}
+
+function termRow(key, title, span, hs, close) {
+  if (!hs.length) return '';
+  const when = span ? `${fmtDate(span.from, { day: 'numeric', month: 'short', year: 'numeric' })} – ${fmtDate(span.to, { day: 'numeric', month: 'short', year: 'numeric' })}` : '';
+  return `<div class="sp" style="margin-top:4px"><h2>${title} <span class="muted small" style="font-weight:500">· ${when}</span></h2>
+      <span class="small muted">${key === 'short' ? 'for trading: next session to about one month' : 'for investing: 3 months to 1 year (6-month and 1-year ranges are estimates)'}</span></div>
+    <div class="tiles">${hs.map(h => horizonTile(h, close)).join('')}</div>`;
+}
+
+function rangeForDate(fc, iso) {
+  const c = fc.cone;
+  if (!iso || !c.length) return null;
+  const i = c.findIndex(p => String(p.time) >= iso);
+  return i < 0 ? null : { ...c[i], n: i + 1 };
 }
 
 function formulaHtml(m) {
@@ -1030,7 +1144,8 @@ function formulaHtml(m) {
     <ol class="steps" style="padding-left:18px">
       <li><b>Expected size of the move (σ̂).</b> A ridge regression predicts how big the move will be, from ${(m.vol_inputs || []).length || 17} volatility inputs (${esc((m.vol_inputs || []).join(', '))}):<br>
         ${f('ln(|ln(P<sub>t+h</sub>/P<sub>t</sub>)| + 0.002) = b₀ + Σ bⱼ·vⱼ   ⇒   σ̂<sub>h</sub> = e<sup>b₀ + Σ bⱼ·vⱼ</sup>')}<br>
-        Range method in use: ${Object.entries(hz).filter(([, v]) => v.available).map(([, v]) => `${esc(v.label)} = ${esc(meth[v.range_method] || v.range_method)}`).join('; ')}. Picked daily by the lowest interval score (width + 2/α × miss) on unseen data.</li>
+        Range method in use: ${Object.entries(hz).filter(([, v]) => v.available && !v.extrapolated).map(([, v]) => `${esc(v.label)} = ${esc(meth[v.range_method] || v.range_method)}`).join('; ')}. Picked daily by the lowest interval score (width + 2/α × miss) on unseen data.
+        Long term: ${f('σ̂<sub>6m, 1y</sub> = σ̂<sub>3m</sub> × √(h / 60)')} with the 3-month shape (an estimate until enough history exists to test it).</li>
       <li><b>Measured shape of DSE moves.</b> z = ln(P<sub>t+h</sub>/P<sub>t</sub>) / σ̂<sub>h</sub> over all past stock-days; q<sub>p</sub> = p-th percentile of z (fat tails and circuit-limit jumps included).</li>
       <li><b>Price range</b> at confidence c (50%, 68%, 90%):<br>
         ${f('Low = P<sub>t</sub> · e<sup>q<sub>(1−c)/2</sub> · σ̂<sub>h</sub></sup>')}  ${f('High = P<sub>t</sub> · e<sup>q<sub>(1+c)/2</sub> · σ̂<sub>h</sub></sup>')}  ${f('Midpoint = P<sub>t</sub> · e<sup>q<sub>0.5</sub> · σ̂<sub>h</sub></sup>')}<br>
@@ -1038,7 +1153,11 @@ function formulaHtml(m) {
       <li><b>Direction</b> (shown only when it passes the test below): inputs are clipped to the 1st–99th percentile and standardised, zᵢ = (xᵢ − meanᵢ) / sdᵢ, then<br>
         ${f('P(up) = 1 / (1 + e<sup>−(w₀ + Σ wᵢ·zᵢ)</sup>)')}   (logistic regression, L2 penalty)   and   ${f('E[ln(P<sub>t+h</sub>/P<sub>t</sub>)] = β₀ + Σ βᵢ·zᵢ')}   (ridge, λ = 0.1·n)</li>
       <li><b>Reliability gate:</b> in 3 rolling unseen windows of 15 sessions, rank correlation between forecast and actual return &gt; 0.03 in every window, AUC &gt; 0.53, and the model's top 10 beat the average liquid share. Otherwise: "no reliable signal".</li>
-      <li><b>Planning levels:</b> ${f('Stop = P − 1.5 × ATR14')}, ${f('Target = top of 1-month 68% range')}, ${f('Reward:risk = (Target − P) / (P − Stop)')}.</li>
+      <li><b>Trade plan:</b> ${f('Stop = P − 1.5 × ATR14')} (holders: ${f('trailing stop = highest close since buying − 2.5 × ATR')}), ${f('T1 = top of 1-week 50% range')}, ${f('T2 = top of 1-month 68% range')}, ${f('Reward:risk = (T − P) / (P − Stop)')}.<br>
+        ${f('Win rate = share of past stock-days where the high reached +u·σ before the low reached −d·σ within 20 sessions')}, with u = ln(T2/P)/σ, d = ln(P/Stop)/σ, σ = 60-day daily volatility. ${f('EV = mean(+u if target first, −d if stop first, else 20-day return) · σ')}.<br>
+        Buy zone = P · e<sup>(30th / 50th percentile of next-session low in σ)·σ</sup> (about 70% / 50% chance of a fill). ${f('Shares = min(Capital × Risk% / (Entry − Stop), Capital × Max% / Entry)')}.</li>
+      <li><b>Signal:</b> BUY = uptrend pullback (price &gt; SMA50, SMA20 &gt; SMA50, RSI 40–65, ≤ 5% above SMA20) + reward:risk ≥ 1.5 + EV &gt; 0 + liquid + not category Z. AVOID/SELL = price &lt; falling SMA50, score ≤ −40, death cross, new 52-week low, seriously negative news, or the trailing stop hit. ACCUMULATE = long-term score ≥ 70.</li>
+      <li><b>AI news score</b> (local Ollama model, see Settings): each non-routine announcement rated −2 … +2; the model input is the 30-day sum. It is tested like every other input.</li>
       <li><b>Long-term score:</b> ${f('100 × (0.25·Valuation + 0.25·Dividends + 0.20·Growth + 0.30·Stability)')}, each a percentile rank among category-A, profitable, liquid companies.</li>
     </ol>
     <h3 class="mt">The ${(m.inputs || []).length} direction-model inputs</h3>
@@ -1076,13 +1195,19 @@ function stockPredictionHtml(one) {
   const L = S.rangeLevel;
   const outer = L === 90 ? 68 : 90;
   return `${head}
+    ${tradePlanHtml(one)}
+    ${bdStockCardHtml(one)}
     <div class="toolbar"><span class="small muted">Range shown:</span>
-      <div class="seg" id="lvl-seg">${[50, 68, 90].map(l => `<button data-l="${l}" class="${L === l ? 'on' : ''}">${l}%${l === 50 ? ' · narrowest' : l === 90 ? ' · safest' : ''}</button>`).join('')}</div>
+      <div class="seg" id="lvl-seg">${[30, 50, 68, 90].map(l => `<button data-l="${l}" class="${L === l ? 'on' : ''}">${l}%${l === 30 ? ' · tightest' : l === 90 ? ' · safest' : ''}</button>`).join('')}</div>
       <span class="small muted">A narrower range is missed more often; each tile shows how often it held in tests.</span></div>
-    <div class="tiles">${fc.horizons.map(h => horizonTile(h, close)).join('')}</div>
+    ${termRow('short', 'Short term', fc.date_ranges && fc.date_ranges.short, fc.horizons.filter(h => h.term === 'short'), close)}
+    ${termRow('long', 'Long term', fc.date_ranges && fc.date_ranges.long, fc.horizons.filter(h => h.term === 'long'), close)}
+    <div class="card"><div class="card-h"><h2>Range for a date</h2><span class="small muted">pick any trading day up to one year ahead</span></div>
+      <div class="card-b toolbar"><input type="date" id="pick-date" min="${esc(fc.cone[0].time)}" max="${esc(fc.cone[fc.cone.length - 1].time)}" value="${esc(fc.cone[Math.min(9, fc.cone.length - 1)].time)}">
+        <div id="pick-out" class="small" style="flex:1;min-width:260px"></div></div></div>
     <div class="grid g-main">
       <div class="card fill">
-        <div class="card-h"><h2>Forecast cone</h2><span class="small muted">next 60 trading days (Sun–Thu; public holidays not known)</span></div>
+        <div class="card-h"><h2>Forecast cone</h2><div class="seg" id="cone-seg"><button data-v="short" class="${S.coneView !== 'long' ? 'on' : ''}">Short term</button><button data-v="long" class="${S.coneView === 'long' ? 'on' : ''}">Long term</button></div><span class="small muted">trading days Sun–Thu, DSE holidays skipped (next year projected)</span></div>
         <div class="pane-label"><span class="key"><i style="background:var(--s1)"></i>Price</span><span class="key"><i class="dash-s1"></i>Midpoint path</span><span class="key"><i style="background:var(--s2)"></i>${RANGE_NAMES[L]} (${L}%)</span><span class="key"><i class="dash"></i>${RANGE_NAMES[outer]} (${outer}%)</span></div>
         <div class="chart-box grow" id="pc" style="min-height:340px"><div class="ohlc" id="pc-legend"></div></div>
       </div>
@@ -1102,7 +1227,7 @@ function stockPredictionHtml(one) {
       </div></div>
     </div>
     <div class="grid g2">
-      <div class="card"><div class="card-h"><h2>What the model sees</h2><div class="seg" id="drv-seg">${fc.horizons.map(h => `<button data-h="${h.h}" class="${h.h === m1.h ? 'on' : ''}">${esc(h.label)}</button>`).join('')}</div></div>
+      <div class="card"><div class="card-h"><h2>What the model sees</h2><div class="seg" id="drv-seg">${fc.horizons.filter(h => !h.extrapolated).map(h => `<button data-h="${h.h}" class="${h.h === m1.h ? 'on' : ''}">${esc(h.label)}</button>`).join('')}</div></div>
         <div class="card-b"><div id="drv-lean" class="note"></div><div id="drv" class="mt"></div>
         <p class="small muted mt">Bars show which inputs push the model toward up (▲) or down (▼). Treat this as a description of the chart, not a forecast, unless the horizon is marked reliable.</p></div></div>
       <div class="card"><div class="card-h"><h2>This stock's past forecasts vs actual</h2><span class="small muted">checked every trading day</span></div>
@@ -1115,18 +1240,23 @@ function stockPredictionHtml(one) {
           <div class="card-b small muted">Inside the ${lvl}% range ${track.filter(inT).length} of ${track.length} times shown (target about ${lvl}%). <a href="#/accuracy">All stocks →</a></div>`;
         })() : '<div class="card-b muted small">Forecasts are saved every trading day. Their outcomes appear here once each horizon has passed.</div>'}</div></div>
     </div>
-    <div class="card"><div class="card-h"><h2>News &amp; announcements</h2><span class="small muted">from DSE · used by the model (tone, earnings surprise, dividend, record date)</span></div>
+    ${aiCardHtml(one)}
+    <div class="card"><div class="card-h"><h2>News &amp; announcements</h2><span class="small muted">from DSE · used by the model (tone, earnings surprise, dividend, record date, AI score)</span></div>
       <div class="card-b">${newsListHtml(one.news, one.tag_labels)}</div></div>`;
 }
 
 function mountPredictChart(one) {
-  const fc = one.forecast;
-  if (!fc || !one.history.length) return;
+  const fc0 = one.forecast;
+  if (!fc0 || !one.history.length) return;
+  const longView = S.coneView === 'long';
+  // short term: last 3 months of prices + the next 20 sessions; long term: everything + 1 year ahead
+  const fc = { ...fc0, cone: longView ? fc0.cone : fc0.cone.slice(0, 20) };
+  const history = longView ? one.history : one.history.slice(-60);
   const c = colors();
   const ch = makeChart($('#pc'));
   const price = ch.addLineSeries({ color: c.s1, lineWidth: 2, priceLineVisible: false });
-  price.setData(one.history);
-  const last = one.history[one.history.length - 1];
+  price.setData(history);
+  const last = history[history.length - 1];
   const line = (key, color, extra = {}) => {
     const s = ch.addLineSeries({ color, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, ...extra });
     s.setData([{ time: last.time, value: last.value }, ...fc.cone.map(p => ({ time: p.time, value: p[key] }))]);
@@ -1140,7 +1270,7 @@ function mountPredictChart(one) {
   line('low' + O, c.muted, { lineWidth: 1, lineStyle: LWC.LineStyle.Dashed });
   ch.timeScale().fitContent();
   const cone = new Map(fc.cone.map(p => [String(p.time), p]));
-  const hist = new Map(one.history.map(p => [String(p.time), p.value]));
+  const hist = new Map(history.map(p => [String(p.time), p.value]));
   const legend = t => {
     const el = $('#pc-legend');
     if (!el) return;
@@ -1152,6 +1282,39 @@ function mountPredictChart(one) {
   };
   legend(null);
   ch.subscribeCrosshairMove(p => legend(p && p.point ? p.time : null));
+}
+
+function signalTable(rows, emptyMsg) {
+  return tableHtml([
+    { key: 'code', label: 'Code', html: r => `<span class="code">${esc(r.code)}</span> ${catBadge(r.category)}<span class="nm">${esc(r.name || '')}</span>` },
+    { key: 'signal', label: 'Signal', html: r => sigBadge(r.signal) },
+    { key: 'close', label: 'Price', align: 'r', html: r => fmt(r.close) },
+    { key: 'zone', label: 'Buy zone', align: 'r', html: r => (r.buy_zone ? `${fmt(r.buy_zone[0])} – ${fmt(r.buy_zone[1])}` : '—') },
+    { key: 'stop', label: 'Stop', align: 'r', html: r => `<span class="down">${fmt((r.holding && r.holding.trailing_stop) || r.stop)}</span>` },
+    { key: 't1', label: 'T1', align: 'r', html: r => `<span class="up">${fmt(r.t1)}</span>` },
+    { key: 't2', label: 'T2', align: 'r', html: r => `<span class="up">${fmt(r.t2)}</span>` },
+    { key: 'rr2', label: 'R:R', align: 'r', html: r => (isNum(r.rr2) ? `1:${fmt(r.rr2, 1)}` : '—') },
+    { key: 'win', label: 'Win %', align: 'r', title: 'Historical chance T2 is reached before the stop (20 sessions)', html: r => (isNum(r.win_rate) ? fmt(r.win_rate, 0) + '%' : '—') },
+    { key: 'ev', label: 'EV / trade', align: 'r', title: 'Historical average result per trade with this stop and target', html: r => (isNum(r.ev_pct) ? `<span class="${dir(r.ev_pct)}">${fmtPct(r.ev_pct, 2)}</span>` : '—') },
+    { key: 'shares', label: 'Shares', align: 'r', html: r => (isNum(r.shares) && r.shares ? fmtInt(r.shares) : '—') },
+    { key: 'exit', label: 'Exit / review by', title: 'Short-term: if neither stop nor T2 is hit by this date', html: r => (r.dates ? fmtDate(r.dates.short.exit_by, { day: 'numeric', month: 'short' }) : '—') },
+    { key: 'why', label: 'Why', cls: 'wrap', html: r => `<span class="small">${esc((r.reasons || [])[0] || '')}</span>` },
+  ], rows, null, emptyMsg);
+}
+
+function signalsCardHtml(pl) {
+  if (!pl || !pl.date) return '';
+  const c = pl.counts || {};
+  const rec = (pl.tables || {}).buy_record || {}, srec = (pl.tables || {}).sell_record || {};
+  const tabs = [['buy', `BUY (${c.BUY || 0})`], ['acc', `ACCUMULATE (${c.ACCUMULATE || 0})`], ['hold', `Your holdings (${pl.holdings.length})`], ['watch', `Watchlist (${pl.watch.length})`], ['avoid', `Avoid: BD risk (${(pl.avoid_bd || []).length})`]];
+  return `<div class="card" id="sig-card"><div class="card-h"><h2>Today's buy / sell signals</h2>${pl.regime ? `<span class="label ${REGIME_CLASS[pl.regime] || ''}" title="Market regime">${esc(pl.regime)} market</span>` : ''}
+      <div class="seg" id="sig-seg">${tabs.map(([k, l], i) => `<button data-k="${k}" class="${i ? '' : 'on'}">${l}</button>`).join('')}</div></div>
+    <div class="card-b small"><div class="note">${rec.trades ? `<b>BUY rule record (past year):</b> ${fmtInt(rec.trades)} trades, target reached first ${fmt(rec.win_rate, 0)}%, stopped ${fmt(rec.stop_rate, 0)}%, average <b>${fmtPct(rec.avg_trade, 2)}</b> per trade vs ${fmtPct(rec.baseline_trade, 2)} for random entries with the same exits. ` : ''}${srec.signals ? `<b>SELL rule:</b> 20 sessions after a sell signal shares averaged ${fmtPct(srec.fwd20, 2)} vs ${fmtPct(srec.all20, 2)} for all shares.` : ''} Win rate is below 50% by design: winners are bigger than losers, so <b>always place the stop</b>.${pl.settings && pl.settings.capital ? '' : ' <a href="#/settings">Set your capital and risk %</a> to get share quantities.'}</div></div>
+    <div class="table-wrap" id="sig-buy">${signalTable(pl.buy, 'No BUY signals today — normal in a weak market')}</div>
+    <div class="table-wrap" id="sig-acc" hidden>${signalTable(pl.accumulate, 'No candidates')}</div>
+    <div class="table-wrap" id="sig-hold" hidden>${signalTable(pl.holdings, 'No holdings — add transactions on the Portfolio page')}</div>
+    <div class="table-wrap" id="sig-watch" hidden>${signalTable(pl.watch, 'Your watchlist is empty')}</div>
+    <div class="table-wrap" id="sig-avoid" hidden>${signalTable(pl.avoid_bd || [], 'No Bangladesh-specific red flags today')}</div></div>`;
 }
 
 function picksHtml(pk, meta) {
@@ -1171,6 +1334,7 @@ function picksHtml(pk, meta) {
     { key: 'stop', label: 'Stop', align: 'r', html: r => `<span class="down">${fmt(r.stop)}</span>` },
     { key: 'target', label: 'Target', align: 'r', html: r => `<span class="up">${fmt(r.target)}</span>` },
     { key: 'rr', label: 'Reward:risk', align: 'r', html: r => (isNum(r.reward_risk) ? `1 : ${fmt(r.reward_risk, 1)}` : '—') },
+    { key: 'hold', label: 'Hold until', html: r => (r.hold_until ? fmtDate(r.hold_until, { day: 'numeric', month: 'short' }) : '—') },
   ], shortRows, null, 'No share matches the setup today — that is normal in a weak market.');
   const longTable = tableHtml([
     { key: 'rank', label: '#', html: (r) => n(r, longRows.indexOf(r)) },
@@ -1185,8 +1349,12 @@ function picksHtml(pk, meta) {
     { key: 'vol', label: 'Volatility', align: 'r', html: r => fmt(r.volatility, 0) + '%' },
     { key: 'trend', label: 'Trend', html: r => (r.trend ? '<span class="up">Up</span>' : '<span class="muted">Mixed</span>') },
     { key: 'r3m', label: '3-month likely range', align: 'r', html: r => (r.range_3m ? `${fmt(r.range_3m[0])} – ${fmt(r.range_3m[1])}` : '—') },
+    { key: 'r1y', label: '1-year range (50%, est.)', align: 'r', html: r => (r.range_1y ? `${fmt(r.range_1y[0])} – ${fmt(r.range_1y[1])}` : '—') },
   ], longRows, null, 'No candidates yet.');
-  return `<div class="card-h"><h2>Top 10 ideas</h2><div class="seg" id="pk-seg"><button data-k="short" class="on">Short term (1–4 weeks)</button><button data-k="long">Long term (regular buying)</button></div></div>
+  const dr = pk.date_ranges || {};
+  const D = x => fmtDate(x, { day: 'numeric', month: 'short', year: 'numeric' });
+  return `<div class="card-h"><h2>Top 10 ideas</h2><div class="seg" id="pk-seg"><button data-k="short" class="on">Short term${dr.short ? ` · ${fmtDate(dr.short.from, { day: 'numeric', month: 'short' })} – ${fmtDate(dr.short.to, { day: 'numeric', month: 'short' })}` : ' (1–4 weeks)'}</button><button data-k="long" class="">Long term${dr.long ? ` · to ${fmtDate(dr.long.to, { month: 'short', year: 'numeric' })}` : ''}</button></div></div>
+    ${dr.long ? `<div class="card-b small muted" style="padding-bottom:0">Short term: trades held up to <b>${D(dr.short.to)}</b>. Long term: accumulate until <b>${D(dr.long.accumulate_to)}</b>, review on <b>${D(dr.long.review)}</b>, 1-year horizon <b>${D(dr.long.to)}</b>.</div>` : ''}
     <div id="pk-short">
       <div class="card-b"><div class="note"><b>Setup:</b> liquid A/B/N shares (≥ Tk ${fmt(pk.liquid_mn, 0)} mn traded per day) in an uptrend (price above the 50-day average, 20-day above 50-day) that have pulled back: RSI 40–65 and no more than 5% above the 20-day average. Ranked by ${esc(pk.short_ranked_by || 'trend strength')}. Stop = 1.5 × daily range (ATR) below the price; target = top of the 1-month likely range.<br>
         <b>Track record (past year):</b> ${rule.days ? `picks beat the average liquid share in ${fmt(rule.beat_rate, 0)}% of 1-month periods, by ${fmtPct(rule.avg_excess)} on average (1 week: ${fmt(rule1w.beat_rate, 0)}%, ${fmtPct(rule1w.avg_excess)}). A small edge, not a sure thing: use the stop.` : 'not enough history yet.'}
@@ -1202,7 +1370,9 @@ function picksHtml(pk, meta) {
 
 async function viewPredict(el, args, ctx) {
   const code = (args[0] || '').toUpperCase();
-  const [base, one] = await Promise.all([api('/predict'), code ? api('/predict/' + encodeURIComponent(code)) : Promise.resolve(null)]);
+  const [base, one, pl] = await Promise.all([
+    api('/predict'), code ? api('/predict/' + encodeURIComponent(code)) : Promise.resolve(null),
+    code ? Promise.resolve(null) : api('/plans').catch(() => null)]);
   if (!ctx.alive()) return;
   getQuotes().catch(() => {});
   const m = base.meta || {};
@@ -1222,7 +1392,7 @@ async function viewPredict(el, args, ctx) {
       <button class="btn btn-primary">Show prediction</button>
       ${base.watchlist.length ? `<span class="small muted">Watchlist:</span><div class="chips">${base.watchlist.map(c => `<a class="chip" href="#/predict/${encodeURIComponent(c)}">${esc(c)}</a>`).join('')}</div>` : ''}
     </form></div>
-    ${one ? stockPredictionHtml(one) : ''}
+    ${one ? stockPredictionHtml(one) : paperCardHtml(pl && pl.record) + signalsCardHtml(pl)}
     <div class="card" id="picks">${picksHtml(base.picks || {}, m)}</div>
     <div class="card"><div class="card-h"><h2>How reliable are these forecasts?</h2><span class="small muted">tested on ${hz['5'] && hz['5'].backtest ? `${hz['5'].backtest.windows} unseen windows, ${fmtDate(hz['5'].backtest.test_from)} – ${fmtDate(hz['5'].backtest.test_to)}` : 'recent unseen data'}</span></div>
       <div class="card-b">
@@ -1251,6 +1421,39 @@ async function viewPredict(el, args, ctx) {
     if (tr) location.hash = '#/predict/' + encodeURIComponent(tr.dataset.code);
   }));
   $$('#lvl-seg button').forEach(b => b.addEventListener('click', () => { S.rangeLevel = Number(b.dataset.l); rerender(); }));
+  $$('#cone-seg button').forEach(b => b.addEventListener('click', () => { S.coneView = b.dataset.v; rerender(); }));
+  const pick = $('#pick-date');
+  if (pick && one && one.forecast) {
+    const show = () => {
+      const p = rangeForDate(one.forecast, pick.value);
+      const close = one.forecast.close;
+      $('#pick-out').innerHTML = p
+        ? `<b>${fmtDate(p.time, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' })}</b> (trading day ${p.n}${p.n > 60 ? ', estimate' : ''}): most likely <b>${fmt(p.low50)} – ${fmt(p.high50)}</b> (50%, ${fromClose(p.low50, close)} to ${fromClose(p.high50, close)}) · 68%: ${fmt(p.low68)} – ${fmt(p.high68)} · 90%: ${fmt(p.low90)} – ${fmt(p.high90)} · midpoint ${fmt(p.median)}`
+        : '<span class="muted">Pick a date within the next year.</span>';
+    };
+    pick.addEventListener('change', show);
+    show();
+  }
+  $$('#sig-seg button').forEach(b => b.addEventListener('click', () => {
+    $$('#sig-seg button').forEach(x => x.classList.toggle('on', x === b));
+    ['buy', 'acc', 'hold', 'watch', 'avoid'].forEach(k => { const el2 = $('#sig-' + k); if (el2) el2.hidden = k !== b.dataset.k; });
+  }));
+  const sc = $('#sig-card');
+  if (sc) sc.addEventListener('click', e => { const tr = e.target.closest('tr[data-code]'); if (tr) location.hash = '#/predict/' + encodeURIComponent(tr.dataset.code); });
+  const gen = $('#ai-gen');
+  if (gen && one) gen.addEventListener('click', async () => {
+    gen.disabled = true;
+    gen.textContent = 'Writing…';
+    $('#ai-out').innerHTML = '<p class="muted small">The local model is writing (about 30 seconds)…</p>';
+    try {
+      const r = await api('/ai/note/' + encodeURIComponent(one.instrument.code), { method: 'POST' });
+      $('#ai-out').innerHTML = mdLite(r.note.note) + `<p class="small muted">${esc(r.note.model || '')} · ${fmtTime(r.note.created_at)}</p>`;
+      gen.textContent = 'Rewrite';
+    } catch (err) {
+      $('#ai-out').innerHTML = `<p class="down small">${esc(err.message)}</p>`;
+      gen.textContent = 'Write note';
+    } finally { gen.disabled = false; }
+  });
   if (one && one.forecast) {
     const fc = one.forecast;
     const showDrivers = hVal => {
@@ -1277,8 +1480,9 @@ const accTarget = { in68: 68, in90: 90, direction: 50 };
 async function viewAccuracy(el, args, ctx) {
   const h = Number(args[0]) || 1;
   const date = args[1] || '';
-  const d = await api(`/accuracy?h=${h}${date ? '&date=' + encodeURIComponent(date) : ''}`);
+  const [d, paper] = await Promise.all([api(`/accuracy?h=${h}${date ? '&date=' + encodeURIComponent(date) : ''}`), api('/signals/log').catch(() => null)]);
   if (!ctx.alive()) return;
+  S.paperLog = paper;
   const checks = d.checks || [];
   if (!checks.length) {
     ctx.render(`<div class="page-h"><div><h1>Forecast accuracy</h1></div></div>
@@ -1328,6 +1532,7 @@ async function viewAccuracy(el, args, ctx) {
       <div class="card-b small">${det.made_on ? `${esc(horizons[h])} forecasts made on <b>${fmtDate(det.made_on)}</b>, checked against the close on <b>${fmtDate(det.check_date)}</b>: ${rows.length} stocks, <b>${fmt(inside, 0)}%</b> ended inside the ${lv}% range (target ${lv}%). Sorted by biggest miss.` : 'No details.'}</div>
       <div class="table-wrap tall" id="acc-t"></div></div>
     <div class="card"><div class="card-h"><h2>Daily checks</h2><span class="small muted">${esc(horizons[h])}</span></div><div class="table-wrap tall" id="acc-days"></div></div>
+    ${paper ? `${paperCardHtml(paper)}<div class="card"><div class="card-h"><h2>Paper trades (every BUY signal)</h2><span class="small muted">filled if the next session reaches the entry limit; then stop, Target 2 or the exit date, whichever comes first</span></div><div class="table-wrap tall" id="paper-t"></div></div>` : ''}
     <p class="disclaimer">"Inside likely range" should be close to 68% and "inside wide range" close to 90% if the ranges are honest. Direction near 50% means the up/down model has no edge, which is why its calls stay hidden on the Prediction page until it does better.</p>`);
 
   mountTable($('#acc-t'), [
@@ -1359,6 +1564,23 @@ async function viewAccuracy(el, args, ctx) {
     { key: 'bias_pct', label: 'Bias', align: 'r', title: 'Average (actual − midpoint): negative = prices ended lower than the midpoint', html: r => fmtPct(r.bias_pct) },
   ], hChecks, { sort: 'check_date', dir: -1 });
 
+  const pt = $('#paper-t');
+  if (pt && paper) {
+    const ST = { pending: 'waiting for fill', open: 'open', target: 'target ✓', stopped: 'stopped ✗', expired: 'time exit', missed: 'not filled' };
+    mountTable(pt, [
+      { key: 'signal_date', label: 'Signal', html: r => fmtDate(r.signal_date, { day: 'numeric', month: 'short' }) },
+      { key: 'code', label: 'Code', html: r => `<span class="code">${esc(r.code)}</span><span class="nm">${esc(r.name || '')}</span>` },
+      { key: 'entry_limit', label: 'Entry limit', align: 'r', html: r => fmt(r.entry_limit) },
+      { key: 'stop', label: 'Stop', align: 'r', html: r => `<span class="down">${fmt(r.stop)}</span>` },
+      { key: 't2', label: 'Target 2', align: 'r', html: r => `<span class="up">${fmt(r.t2)}</span>` },
+      { key: 'exit_by', label: 'Exit by', html: r => fmtDate(r.exit_by, { day: 'numeric', month: 'short' }) },
+      { key: 'status', label: 'Status', html: r => `<span class="${r.status === 'target' ? 'up' : r.status === 'stopped' ? 'down' : 'muted'}">${ST[r.status] || esc(r.status)}</span>` },
+      { key: 'entry_price', label: 'Filled at', align: 'r', html: r => fmt(r.entry_price) },
+      { key: 'exit_price', label: 'Exit / last', align: 'r', html: r => fmt(r.exit_price) },
+      { key: 'return_pct', label: 'Result', align: 'r', html: r => chg(r.return_pct) },
+      { key: 'sessions', label: 'Sessions', align: 'r', html: r => fmtInt(r.sessions) },
+    ], paper.rows || [], { sort: 'signal_date', dir: -1 }, { empty: 'No signals logged yet' });
+  }
   $('#acc-date').addEventListener('change', e => { location.hash = `#/accuracy/${h}/${e.target.value}`; });
   $$('#acc-f button').forEach(b => b.addEventListener('click', () => { S.accFilter = b.dataset.f; rerender(); }));
 
@@ -1382,6 +1604,142 @@ async function viewAccuracy(el, args, ctx) {
   $$('#acc-lvl button').forEach(b => b.addEventListener('click', () => { S.rangeLevel = Number(b.dataset.l); rerender(); }));
   daily('#acc-range', x => (lv === 50 ? x.in50 : lv === 90 ? x.in90 : x.in68), lv);
   daily('#acc-dir', x => (x.dir_n ? (x.dir_hits / x.dir_n) * 100 : null), 50);
+}
+
+/* ---------------- Bangladesh factors */
+const REGIME_CLASS = { Calm: 'b', Euphoric: '', Nervous: 'be', Stress: 'sbe' };
+const evBadge = e => `<span class="label ${e === 'strong' ? 'sbe' : e === 'moderate' ? 'be' : ''}">${esc(e || 'n/a')}</span>`;
+const BD_KIND_LABEL = { dse_query: 'DSE query', rumour: 'Rumour clarification', sponsor_buy: 'Sponsor buy', sponsor_sell: 'Sponsor sell',
+  to_z: 'To Z', from_z: 'From Z', margin_ban: 'Margin ban', regulator: 'Regulator', govt: 'Government/state' };
+
+function bdStockCardHtml(one) {
+  const b = one.bd || {};
+  const spec = b.speculation;
+  const reg = b.regime || {};
+  const rs = (b.regime_stats || {})[reg.regime] || {};
+  const events = b.recent_events || [];
+  const sb = (b.spec_stats || {}).High || {};
+  return `<div class="card"><div class="card-h"><h2>Bangladesh factors</h2><a class="small" href="#/bd">How these are measured →</a></div><div class="card-b">
+    <div class="plan-grid">
+      <div class="cell"><div class="k">Market regime now</div><div class="v"><span class="label ${REGIME_CLASS[reg.regime] || ''}">${esc(reg.regime || '—')}</span></div><div class="d">${isNum(rs.fwd20) ? `after such days the market moved ${fmtPct(rs.fwd20, 1)} over 20 sessions (up ${fmt(rs.pos20, 0)}% of the time)` : ''}</div></div>
+      <div class="cell"><div class="k">Pump-and-dump risk</div><div class="v ${spec && spec.score >= 60 ? 'down' : ''}">${spec ? `${spec.score}/100` : '—'}</div><div class="d">${spec && spec.why.length ? esc(spec.why.join(' · ')) : 'no speculative pattern'}</div></div>
+      <div class="cell"><div class="k">High-risk shares historically</div><div class="v">${isNum(sb.ex20) ? fmtPct(sb.ex20, 1) : '—'}</div><div class="d">typical 20-session result vs market; 1 in 10 fell ${isNum(sb.p10) ? fmt(Math.abs(sb.p10), 0) : '—'}%+, 1 in 10 gained ${isNum(sb.p90) ? fmt(sb.p90, 0) : '—'}%+</div></div>
+    </div>
+    <h3 class="mt">Recent Bangladesh-specific events for this share (last 45 days)</h3>
+    ${events.length ? `<ul class="list-plain small">${events.map(e => `<li class="sp"><span><b>${fmtDate(e.date, { day: 'numeric', month: 'short' })}</b> · ${esc(e.label)}</span><span>${isNum(e.ex20) ? `typically ${fmtPct(e.ex20, 1)} vs market over 20 sessions (n=${e.n})` : ''} ${evBadge(e.evidence)}</span></li>`).join('')}</ul>` : '<p class="muted small">None: no DSE query, rumour clarification, insider declaration, category change, margin ban or regulator/government news recently.</p>'}
+  </div></div>`;
+}
+
+async function viewBD(el, args, ctx) {
+  const d = await api('/bd');
+  if (!ctx.alive()) return;
+  if (!d.built_at) {
+    ctx.render(`<div class="page-h"><div><h1>Bangladesh factors</h1></div></div><div class="card">${empty('Not built yet', '<p>They are measured after each end-of-day run.</p><button class="btn btn-primary" data-job="daily" data-force="1">Run end-of-day now</button>')}</div>`);
+    return;
+  }
+  const reg = d.regime_now || {};
+  const used = s => s.direction === 'negative' && s.evidence !== 'weak';
+  const studies = Object.entries(d.studies || {});
+  const stats = d.regime_stats || {};
+  ctx.render(`
+    <div class="page-h"><div><h1>Bangladesh factors</h1>
+      <div class="sub">Measured on DSE prices ${fmtDate(d.history_from)} – ${fmtDate(d.history_to)} · rebuilt every trading day after the close · updated ${fmtTime(d.built_at)}</div></div></div>
+    <div class="note">Political power cannot be measured directly from any data. This page measures its <b>footprint</b>: market-wide stress, regulator and government involvement in company news, and how shares behaved after rumours, insider deals and category changes. Only effects with real evidence change the buy/sell signals. No company is labelled as politically connected.</div>
+    <div class="grid g-main">
+      <div class="card"><div class="card-h"><h2>Market regime</h2><span class="label ${REGIME_CLASS[reg.regime] || ''}">${esc(reg.regime || '—')}</span><span class="small muted">equal-weight market of all shares</span></div>
+        <div class="chart-box dash" id="bd-reg"></div>
+        <div class="card-b small muted"><div class="legend" style="margin:0 0 6px"><span><i style="background:var(--up-fill);border-radius:50%"></i>Calm</span><span><i style="background:var(--s7);border-radius:50%"></i>Euphoric</span><span><i style="background:var(--s2);border-radius:50%"></i>Nervous</span><span><i style="background:var(--down-fill);border-radius:50%"></i>Stress</span></div>
+          Dots mark where a regime began (lasting 3+ sessions). Stress = sharp fall, drawdown ≥ 8% or volatility spike; Nervous = falling with weak breadth or drying turnover; Euphoric = strong rally on heavy turnover; Calm = otherwise.</div></div>
+      <div class="card"><div class="card-h"><h2>What followed each regime</h2></div><div class="card-b">
+        <div class="kv" style="grid-template-columns:1fr">
+          <div><span>Now</span><span>${esc(reg.regime || '—')} · 20-session market ${fmtPct((reg.m20 || 0) * 100, 1)} · drawdown ${fmtPct((reg.drawdown || 0) * 100, 1)} · breadth ${fmt((reg.breadth5 || 0) * 100, 0)}% rising · turnover ${fmt(reg.turnover_ratio, 2)}× normal</span></div>
+        </div>
+        <div class="table-wrap mt"><table class="t"><thead><tr><th>Regime</th><th class="r">Days</th><th class="r">Market next 20 sessions</th><th class="r">Rose</th></tr></thead><tbody>
+          ${['Calm', 'Euphoric', 'Nervous', 'Stress'].filter(k => stats[k]).map(k => `<tr><td><span class="label ${REGIME_CLASS[k]}">${k}</span></td><td class="r">${stats[k].days}</td><td class="r">${chg(stats[k].fwd20, 1)}</td><td class="r">${fmt(stats[k].pos20, 0)}%</td></tr>`).join('')}
+        </tbody></table></div>
+        <p class="small muted">In Stress, new BUY signals are held back (WAIT) because the market usually kept falling. One year of data contains only a few independent episodes, so treat this as a guide.</p>
+      </div></div>
+    </div>
+    <div class="card"><div class="card-h"><h2>What happened after Bangladesh-specific events</h2><span class="small muted">share vs the equal-weight market · median of all cases</span></div>
+      <div class="table-wrap"><table class="t"><thead><tr><th>Event</th><th class="r">Cases</th><th class="r" title="Share's return in the 20 sessions before the event">Run-up before</th><th class="r">Next session</th><th class="r">Next 5</th><th class="r">Next 20</th><th class="r">Beat market</th><th>Evidence</th><th>Used in signals</th></tr></thead><tbody>
+        ${studies.map(([k, s]) => `<tr><td>${esc(s.label)}</td><td class="r">${fmtInt(s.n)}</td><td class="r">${chg(s.pre20, 1)}</td><td class="r">${chg(s.ex1, 1)}</td><td class="r">${chg(s.ex5, 1)}</td><td class="r" title="Trimmed mean ${fmtPct(s.wmean20, 1)} · raw mean ${fmtPct(s.mean20, 1)}">${chg(s.ex20, 1)}</td><td class="r">${isNum(s.pos20) ? fmt(s.pos20, 0) + '%' : '—'}</td><td>${evBadge(s.evidence)}</td><td class="small">${used(s) ? (k === 'record_date' ? 'Wait until after the record date' : 'Avoid new buys; holders: sell if strong') : '<span class="muted">no</span>'}</td></tr>`).join('')}
+      </tbody></table></div>
+      <div class="card-b small muted">"Evidence" needs the median and the outlier-trimmed mean to agree, a typical move of at least 1%, and a t-statistic ≥ 1.5 (moderate) or ≥ 2.5 (strong). Circuit days and DSE queries show huge <i>average</i> moves caused by a few shares that multiplied; the typical share did not, so they are not used as buy signals.</div></div>
+    <div class="grid g2">
+      <div class="card"><div class="card-h"><h2>Political &amp; regulatory events</h2><span class="small muted">market reaction (equal-weight)</span></div>
+        <div class="table-wrap"><table class="t"><thead><tr><th>Date</th><th>Event</th><th class="r">5 days before</th><th class="r">Next day</th><th class="r">Next 5</th><th class="r">Next 20</th><th></th></tr></thead><tbody>
+          ${(d.events || []).map(e => `<tr><td>${fmtDate(e.date)}</td><td class="wrap"><b>${esc(e.title)}</b><div class="small muted">${esc(e.kind)} · ${esc(e.source)}${e.note ? ' · ' + esc(e.note) : ''}</div></td><td class="r">${chg((e.reaction || {}).pre5, 1)}</td><td class="r">${chg((e.reaction || {}).post1, 1)}</td><td class="r">${chg((e.reaction || {}).post5, 1)}</td><td class="r">${chg((e.reaction || {}).post20, 1)}</td><td>${e.id ? `<button class="x-btn" data-del-event="${e.id}" title="Delete" aria-label="Delete event">✕</button>` : ''}</td></tr>`).join('') || `<tr><td colspan="7">${empty('No events yet')}</td></tr>`}
+        </tbody></table></div>
+        <form class="card-b modal-b" id="ev-form" style="padding:14px 16px" novalidate>
+          <h3>Record an event (political, regulatory, economic)</h3>
+          <div class="row"><label class="field"><span>Date</span><input type="date" name="date" required></label>
+            <label class="field"><span>Kind</span><select name="kind"><option value="political">Political</option><option value="regulatory">Regulatory (BSEC, DSE, Bangladesh Bank)</option><option value="economic">Economic (budget, rates, FX)</option><option value="other">Other</option></select></label></div>
+          <label class="field"><span>What happened</span><input name="title" maxlength="200" placeholder="e.g. Hartal / blockade, new BSEC chairman, policy rate change" required></label>
+          <div class="row"><label class="field"><span>Your expected impact</span><select name="impact"><option value="">—</option><option value="-2">−2 very negative</option><option value="-1">−1 negative</option><option value="0">0 neutral</option><option value="1">+1 positive</option><option value="2">+2 very positive</option></select></label>
+            <label class="field"><span>Note</span><input name="note" maxlength="500"></label></div>
+          <div class="sp"><div class="form-err" id="ev-err"></div><button class="btn btn-primary">Add event</button></div>
+          <p class="small muted">The market's reaction around each event is measured from DSE prices, so over time you see which kinds of events really moved the market.</p>
+        </form></div>
+      <div class="card"><div class="card-h"><h2>Pump-and-dump risk</h2><span class="small muted">score 0–100</span></div><div class="card-b">
+        <div class="table-wrap"><table class="t"><thead><tr><th>Risk</th><th class="r">Cases</th><th class="r">Typical next 20 vs market</th><th class="r">1 in 10 fell</th><th class="r">1 in 10 gained</th></tr></thead><tbody>
+          ${['Low', 'Elevated', 'High'].filter(k => (d.spec_stats || {})[k]).map(k => { const s = d.spec_stats[k]; return `<tr><td>${k}</td><td class="r">${fmtInt(s.samples)}</td><td class="r">${chg(s.ex20, 1)}</td><td class="r down">${fmtPct(s.p10, 0)}</td><td class="r up">${fmtPct(s.p90, 0)}</td></tr>`; }).join('')}
+        </tbody></table></div>
+        <p class="small muted">Points: small company 20, free float &lt; 30% 15, category Z 15, +30% in a month 20, 2+ circuit days 15, volume 3× normal 10, recent DSE query 15. High-risk shares are a lottery: most lag, a few explode. BUY signals skip them.</p>
+        <h3 class="mt">Highest risk today</h3>
+        <div class="table-wrap" id="spec-t"></div>
+      </div></div>
+    </div>
+    <div class="card"><div class="card-h"><h2>Rumours, insider deals &amp; regulator news (last 30 days)</h2></div><div class="card-b">
+      ${(d.recent_flagged || []).length ? `<ul class="list-plain">${d.recent_flagged.map(n => `<li><div class="sp" style="align-items:flex-start"><span>${stockLink(n.code)} <b>${esc(n.summary)}</b> <span class="small muted">${fmtDate(n.news_date, { day: 'numeric', month: 'short' })}</span></span><span class="chips">${n.kinds.map(k => `<span class="chip ${['to_z', 'margin_ban', 'rumour', 'sponsor_sell'].includes(k) ? 'neg' : k === 'sponsor_buy' || k === 'from_z' ? 'pos' : 'warn'}">${esc(BD_KIND_LABEL[k] || k)}</span>`).join('')}</span></div><div class="small muted">${esc((n.body || '').slice(0, 220))}</div></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
+    </div></div>`);
+  mountTable($('#spec-t'), [
+    { key: 'code', label: 'Code', html: r => `<span class="code">${esc(r.code)}</span><span class="nm">${esc(r.name || '')}</span>` },
+    { key: 'score', label: 'Risk', align: 'r', html: r => `<b class="${r.score >= 60 ? 'down' : ''}">${r.score}</b>` },
+    { key: 'r20', label: '1 month', align: 'r', html: r => chg(r.r20, 1) },
+    { key: 'why', label: 'Why', cls: 'wrap', html: r => `<span class="small">${esc(r.why.join(' · '))}</span>` },
+  ], d.spec_top || [], { sort: 'score', dir: -1 }, { empty: 'No high-risk shares today' });
+  const f = $('#ev-form');
+  f.addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+      await api('/bd/events', { method: 'POST', body: { date: f.date.value, kind: f.kind.value, title: f.title.value, impact: f.impact.value, note: f.note.value } });
+      toast('Event added; market reaction is being measured');
+      setTimeout(rerender, 2500);
+    } catch (err) { $('#ev-err').textContent = err.message; }
+  });
+  const hist = d.regime_history || [];
+  if (hist.length) {
+    const c = colors();
+    const ch = makeChart($('#bd-reg'));
+    const s = ch.addLineSeries({ color: c.s1, lineWidth: 2, priceLineVisible: false, priceFormat: { type: 'price', precision: 3, minMove: 0.001 } });
+    s.setData(hist.map(h => ({ time: String(h.date), value: h.index })));
+    const colorOf = { Stress: c.down, Nervous: c.s2, Euphoric: c.s7, Calm: c.up };
+    // mark regime changes that lasted at least 3 sessions (colour dots; legend below the chart)
+    const markers = [];
+    let cur = null;
+    hist.forEach((h, i) => {
+      const lasts = hist.slice(i, i + 3).every(x => x.regime === h.regime);
+      if (h.regime !== cur && lasts) {
+        markers.push({ time: String(h.date), position: 'aboveBar', color: colorOf[h.regime] || c.muted, shape: 'circle', size: 1 });
+        cur = h.regime;
+      }
+    });
+    s.setMarkers(markers);
+    ch.timeScale().fitContent();
+  }
+}
+
+function paperCardHtml(rec) {
+  if (!rec) return '';
+  const cnt = rec.counts || {};
+  return `<div class="card"><div class="card-h"><h2>Live paper-trading record</h2><span class="small muted">every BUY signal followed with real prices since ${fmtDate(rec.since)}</span><a class="small" href="#/accuracy">Full log →</a></div><div class="card-b">
+    <div class="plan-grid">
+      <div class="cell"><div class="k">Closed trades</div><div class="v">${fmtInt(rec.closed || 0)}</div><div class="d">${fmtInt(cnt.open || 0)} open · ${fmtInt(cnt.pending || 0)} waiting for a fill · ${fmtInt(cnt.missed || 0)} not filled</div></div>
+      <div class="cell"><div class="k">Target reached</div><div class="v">${isNum(rec.win_rate) ? fmt(rec.win_rate, 0) + '%' : '—'}</div><div class="d">stopped ${isNum(rec.stop_rate) ? fmt(rec.stop_rate, 0) + '%' : '—'}</div></div>
+      <div class="cell"><div class="k">Average per trade</div><div class="v">${isNum(rec.avg_return) ? `<span class="${dir(rec.avg_return)}">${fmtPct(rec.avg_return, 2)}</span>` : '—'}</div><div class="d">after commission both ways</div></div>
+      <div class="cell"><div class="k">Open trades now</div><div class="v">${isNum(rec.open_avg_return) ? `<span class="${dir(rec.open_avg_return)}">${fmtPct(rec.open_avg_return, 2)}</span>` : '—'}</div><div class="d">average, marked to the last close</div></div>
+    </div>
+    <p class="small muted mt">This is the honest test: signals are logged before the outcome is known. Watch it for several weeks before trusting real money to the signals.</p></div></div>`;
 }
 
 /* ---------------- watchlist */
@@ -1408,12 +1766,15 @@ async function viewWatchlist(el, args, ctx) {
 
 /* ---------------- portfolio */
 async function viewPortfolio(el, args, ctx) {
-  const d = await api('/portfolio');
+  const [d, pl] = await Promise.all([api('/portfolio'), api('/plans').catch(() => null)]);
   if (!ctx.alive()) return;
   S.commissionRate = d.commission_rate;
   const s = d.summary, t = s.totals;
+  const planOf = Object.fromEntries(((pl && pl.holdings) || []).map(p => [p.code, p]));
   const hcols = [
     COL.code,
+    { key: 'action', label: 'Action', html: r => { const p = planOf[r.code]; return p ? `${sigBadge(p.signal)}<div class="small muted" style="max-width:220px;white-space:normal">${esc(p.reasons[0] || '')}</div>` : '—'; } },
+    { key: 'trail', label: 'Trailing stop', align: 'r', html: r => { const p = planOf[r.code]; return p && p.holding ? `<span class="down">${fmt(p.holding.trailing_stop)}</span>` : '—'; } },
     { key: 'qty', label: 'Shares', align: 'r', html: r => fmtInt(r.qty) },
     { key: 'avg_cost', label: 'Avg cost', align: 'r', html: r => fmt(r.avg_cost) },
     { key: 'price', label: 'Price', align: 'r', html: r => fmt(r.price) },
@@ -1539,6 +1900,9 @@ async function viewReport(el, date, ctx) {
     ${pf.positions ? `<div class="card"><div class="card-h"><h2>Your portfolio</h2></div><div class="card-b"><div class="kv">
       <div><span>Market value</span><span>${tk(pf.market_value, 0)}</span></div><div><span>Today</span><span>${tkSigned(pf.day_change)} (${chg(pf.day_change_pct)})</span></div>
       <div><span>Unrealised P/L</span><span>${tkSigned(pf.unrealized)} (${chg(pf.unrealized_pct)})</span></div><div><span>Realised P/L</span><span>${tkSigned(pf.realized)}</span></div></div></div></div>` : ''}
+    ${(r.trade_signals || {}).counts ? `<div class="card"><div class="card-h"><h2>Buy / sell signals</h2><span class="small muted">${Object.entries(r.trade_signals.counts).map(([k, v]) => `${esc(k)} ${v}`).join(' · ')}</span><a class="small" href="#/predict">Prediction page</a></div>
+      ${(r.trade_signals.holdings || []).length ? `<div class="card-b"><h3>Your holdings</h3></div><div class="table-wrap rn">${signalTable(r.trade_signals.holdings.map(h => ({ ...h, holding: { trailing_stop: h.trailing_stop } })), '')}</div>` : ''}
+      <div class="card-b"><h3>BUY signals</h3></div><div class="table-wrap rn">${signalTable(r.trade_signals.buy || [], 'No BUY signals this session')}</div></div>` : ''}
     ${(r.forecast_check || []).length ? `<div class="card"><div class="card-h"><h2>Forecast check</h2><span class="small muted">earlier forecasts vs today's real close</span><a class="small" href="#/accuracy">Details</a></div>
       <div class="table-wrap"><table class="t"><thead><tr><th>Horizon</th><th>Type</th><th>Made on</th><th class="r">Stocks</th><th class="r">In 50% range</th><th class="r">In 68% range</th><th class="r">In 90% range</th><th class="r">Direction right</th><th class="r">Avg miss</th></tr></thead><tbody>
       ${r.forecast_check.map(c => `<tr><td>${esc({ 1: 'Next session', 5: '1 week', 20: '1 month', 60: '3 months' }[c.horizon] || c.horizon)}</td><td>${esc(SRC_LABEL[c.source] || c.source)}</td><td>${fmtDate(c.made_on, { day: 'numeric', month: 'short' })}</td><td class="r">${fmtInt(c.n)}</td><td class="r">${isNum(c.in50) ? `${fmt(c.in50, 0)}% <span class="muted small">/ 50</span>` : '—'}</td><td class="r">${fmt(c.in68, 0)}% <span class="muted small">/ 68</span></td><td class="r">${fmt(c.in90, 0)}% <span class="muted small">/ 90</span></td><td class="r">${fmt(c.direction, 0)}%</td><td class="r">${fmt(c.mae_pct, 2)}%</td></tr>`).join('')}
@@ -1572,7 +1936,7 @@ async function viewReport(el, date, ctx) {
 
 /* ---------------- settings */
 async function viewSettings(el, args, ctx) {
-  const [cfg, st] = await Promise.all([api('/settings'), api('/status')]);
+  const [cfg, st, ai] = await Promise.all([api('/settings'), api('/status'), api('/ai/status').catch(() => ({}))]);
   if (!ctx.alive()) return;
   const s = cfg.settings, h = st.history || {};
   const runs = st.runs || [];
@@ -1612,6 +1976,15 @@ async function viewSettings(el, args, ctx) {
           <label class="field"><span>Circuit-limit warning at (± %)</span><input type="number" step="0.1" min="1" name="circuit_pct" value="${esc(s.circuit_pct)}"></label>
         </div>
         <label class="check"><input type="checkbox" name="intraday_alerts" ${s.intraday_alerts === '1' ? 'checked' : ''}> Check price alerts during market hours</label>
+        <h3>Position sizing (trade plans)</h3>
+        <div class="row">
+          <label class="field"><span>Trading capital (Tk)</span><input type="number" step="1000" min="0" name="capital" value="${esc(s.capital)}"></label>
+          <label class="field"><span>Max loss per trade (% of capital)</span><input type="number" step="0.1" min="0.1" name="risk_pct" value="${esc(s.risk_pct)}"></label>
+        </div>
+        <div class="row">
+          <label class="field"><span>Max in one share (% of capital)</span><input type="number" step="1" min="1" name="max_position_pct" value="${esc(s.max_position_pct)}"></label>
+          <label class="field"><span>AI news scoring per day (minutes)</span><input type="number" step="1" min="0" name="ai_daily_minutes" value="${esc(s.ai_daily_minutes)}"></label>
+        </div>
         <h3>Notifications</h3>
         <label class="check"><input type="checkbox" name="notify_toast" ${s.notify_toast === '1' ? 'checked' : ''}> Windows desktop notifications</label>
         <label class="check"><input type="checkbox" name="notify_telegram" ${s.notify_telegram === '1' ? 'checked' : ''}> Telegram messages (to your phone)</label>
@@ -1622,7 +1995,18 @@ async function viewSettings(el, args, ctx) {
         <label class="field"><span>Dashboard link used in notifications</span><input name="dashboard_url" value="${esc(s.dashboard_url)}"></label>
         <div class="sp"><button type="button" class="btn" id="test-notify">Send test notification</button><button class="btn btn-primary">Save preferences</button></div>
       </div></form>
-      <div class="card"><div class="card-h"><h2>Recent jobs</h2></div><div class="table-wrap" id="runs"></div></div>
+      <div class="grid" style="align-content:start">
+        <div class="card"><div class="card-h"><h2>Local AI (Ollama)</h2>${ai.available ? '<span class="label b">Connected</span>' : '<span class="label be">Not available</span>'}</div><div class="card-b small">
+          <div class="kv" style="grid-template-columns:1fr">
+            <div><span>Server · model</span><span>${esc(ai.host || '')} · ${esc(ai.model || '')}</span></div>
+            <div><span>Announcements rated by AI</span><span>${fmtInt(ai.scored)}</span></div>
+            <div><span>Waiting to be rated (last 120 days)</span><span>${isNum(ai.pending_news) ? fmtInt(ai.pending_news) : '—'}</span></div>
+          </div>
+          <p class="muted">Used to rate each non-routine announcement (−2 … +2, fed to the model as "AI news score") and to write analyst notes. Runs on this PC; nothing is sent online. Change the model in <code>config.ini</code> [ollama].</p>
+          <div class="toolbar"><button class="btn" data-job="ai_news" ${ai.available ? '' : 'disabled'}>Rate pending news now</button></div>
+        </div></div>
+        <div class="card"><div class="card-h"><h2>Recent jobs</h2></div><div class="table-wrap" id="runs"></div></div>
+      </div>
     </div>
     <p class="disclaimer">Data comes from the public Dhaka Stock Exchange website. This tool is for personal research. Technical signals are not investment advice; always check disclosures and fundamentals.</p>`);
   $('#runs').innerHTML = tableHtml([
@@ -1679,6 +2063,13 @@ document.addEventListener('click', async e => {
   if (dal) {
     if (!confirm('Delete this alert?')) return;
     try { await api('/alerts/' + dal.dataset.delAlert, { method: 'DELETE' }); toast('Alert deleted'); rerender(); }
+    catch (err) { toast(err.message, 'err'); }
+    return;
+  }
+  const dev = e.target.closest('[data-del-event]');
+  if (dev) {
+    if (!confirm('Delete this event?')) return;
+    try { await api('/bd/events/' + dev.dataset.delEvent, { method: 'DELETE' }); toast('Event deleted'); setTimeout(rerender, 2500); }
     catch (err) { toast(err.message, 'err'); }
     return;
   }

@@ -14,7 +14,8 @@ from flask import Flask, abort, jsonify, request, send_from_directory
 from flask.json.provider import DefaultJSONProvider
 from werkzeug.exceptions import HTTPException
 
-from . import __version__, alerts, analysis, collector, config, db, news, notifier, portfolio, predict, report, settings
+from . import (__version__, alerts, analysis, bdfactors, collector, config, db, llm, news, notifier, portfolio,
+               predict, report, settings, tradeplan)
 from .monitor import JOBS, MarketMonitor
 
 log = logging.getLogger(__name__)
@@ -293,7 +294,22 @@ def create_app(start_monitor: bool = False) -> Flask:
             }
         setup = bool(an and predict.is_setup(an["close"], an["sma20"], an["sma50"], an["rsi"]))
         meta = predict.meta()
+        plan = tradeplan.plan_for(code) if fc else None
+        intraday = None
+        if fc:
+            quote = db.query_one("SELECT * FROM live_quotes WHERE code=%s", (code,))
+            q1 = (meta.get("horizons", {}).get("1") or {}).get("quantiles")
+            h1 = next((h for h in fc["horizons"] if h["h"] == 1), None)
+            if q1 and h1 and plan:
+                intraday = tradeplan.intraday_range(code, quote, db.get_state("market"), plan["sigma_pct"] / 100, q1)
+        note = llm.cached_note(code, fc["trade_date"]) if fc else None
         return jsonify(
+            bd=bdfactors.stock_view(code),
+            plan=plan,
+            intraday=intraday,
+            ai_note=note,
+            ai=llm.status() if fc else None,
+            buy_record=(db.get_state("trade_tables") or {}).get("buy_record"),
             instrument=inst,
             forecast=fc,
             reason=reason,
@@ -307,6 +323,90 @@ def create_app(start_monitor: bool = False) -> Flask:
             news=news.latest(15, code=code),
             tag_labels=news.TAG_LABELS,
         )
+
+    @app.get("/api/plans")
+    def plans():
+        ap = tradeplan.all_plans()
+        ap.pop("buy_all", None)
+        return jsonify(**ap, record=tradeplan.signal_record(0) | {"rows": []})
+
+    @app.get("/api/signals/log")
+    def signal_log():
+        return jsonify(tradeplan.signal_record(200))
+
+    @app.get("/api/bd")
+    def bd_overview():
+        st = db.get_state("bd_factors") or {}
+        spec = sorted(((c, v) for c, v in (st.get("spec_today") or {}).items() if v["score"] >= 45),
+                      key=lambda kv: -kv[1]["score"])[:25]
+        names = {r["code"]: r["name"] for r in db.query("SELECT code, name FROM instruments")}
+        recent = db.query(
+            "SELECT code, news_date, summary, LEFT(body, 400) AS body FROM news WHERE news_date >= CURDATE() - INTERVAL 30 DAY "
+            "ORDER BY news_date DESC, news_time DESC LIMIT 600")
+        flagged = []
+        for r in recent:
+            kinds = bdfactors.classify_news(r["summary"] or "", r["body"] or "")
+            if kinds:
+                flagged.append({**r, "kinds": kinds, "name": names.get(r["code"])})
+        return jsonify(
+            built_at=st.get("built_at"), history_from=st.get("history_from"), history_to=st.get("history_to"),
+            studies=st.get("studies", {}), regime_now=st.get("regime_now"), regime_stats=st.get("regime_stats", {}),
+            regime_history=st.get("regime_history", []), events=st.get("events", []),
+            user_events=[e for e in bdfactors.market_events() if e["source"] == "you"],
+            spec_stats=st.get("spec_stats", {}),
+            spec_top=[{"code": c, "name": names.get(c), **v} for c, v in spec],
+            recent_flagged=flagged[:60],
+        )
+
+    @app.post("/api/bd/events")
+    def bd_event_add():
+        try:
+            new_id = bdfactors.add_event(_body())
+        except ValueError as e:
+            abort(400, str(e))
+        JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
+        return jsonify(id=new_id)
+
+    @app.delete("/api/bd/events/<int:event_id>")
+    def bd_event_delete(event_id: int):
+        bdfactors.delete_event(event_id)
+        JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
+        return jsonify(ok=True)
+
+    @app.post("/api/ai/note/<code>")
+    def ai_note(code: str):
+        code = code.strip().upper()
+        st = llm.status()
+        if not st["available"]:
+            abort(503, f"Local AI not available ({st.get('error') or 'model ' + st['model'] + ' not installed'})")
+        fc = predict.forecast(code)
+        if not fc:
+            abort(400, "No forecast for this instrument")
+        plan = tradeplan.plan_for(code)
+        inst = db.query_one("SELECT code, name, sector, category FROM instruments WHERE code=%s", (code,))
+        info = db.query_one("SELECT pe, eps, nav, dividend_yield, market_cap, free_float FROM company_info WHERE code=%s", (code,))
+        sig = db.query_one("SELECT score, label, rsi, sma20, sma50, sma200, ret_1m, ret_3m, high52, low52, flags "
+                           "FROM signals WHERE code=%s ORDER BY trade_date DESC LIMIT 1", (code,))
+        facts = {
+            "company": inst, "last_close": fc["close"], "date": fc["trade_date"],
+            "technical": sig, "fundamentals": info,
+            "forecast_ranges": [{k: h[k] for k in ("label", "low50", "high50", "low68", "high68", "median")} for h in fc["horizons"]],
+            "direction_model": "not reliable (no edge in tests); do not state a direction",
+            "trade_plan": {k: plan.get(k) for k in ("signal", "reasons", "buy_zone", "stop", "t1", "t2", "rr2",
+                                                   "win_rate", "ev_pct", "support", "resistance")} if plan else None,
+            "recent_news": [{k: n[k] for k in ("news_date", "summary", "tags")} | {"ai_impact": n.get("ai_impact")}
+                            for n in db.query("SELECT news_date, summary, tags, ai_impact FROM news WHERE code=%s "
+                                              "ORDER BY news_date DESC LIMIT 8", (code,))],
+        }
+        note = llm.analyst_note(code, facts)
+        llm.save_note(code, fc["trade_date"], note)
+        return jsonify(note=llm.cached_note(code, fc["trade_date"]))
+
+    @app.get("/api/ai/status")
+    def ai_status():
+        pending = len(llm.pending_news()) if llm.status()["available"] else None
+        return jsonify(**llm.status(), pending_news=pending,
+                       scored=db.scalar("SELECT COUNT(*) FROM news WHERE ai_impact IS NOT NULL AND ai_reason <> 'Routine notice'"))
 
     @app.get("/api/accuracy")
     def accuracy():
@@ -485,6 +585,9 @@ def create_app(start_monitor: bool = False) -> Flask:
                 "simulate", lambda progress=None: {"forecasts": predict.simulate_history(), "checks": predict.run_checks()}))
         if name == "news":
             return jsonify(started=JOBS.start("news", lambda progress=None: news.fetch_latest()))
+        if name == "ai_news":
+            return jsonify(started=JOBS.start("ai_news", lambda progress=None: llm.score_news(days=120, max_minutes=240,
+                                                                                              progress=progress)))
         if name == "analyze":
             d = db.scalar("SELECT MAX(trade_date) FROM daily_prices")
             if not d:

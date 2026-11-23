@@ -123,6 +123,25 @@ def build(trade_date: date) -> dict[str, Any]:
     my_codes = sorted({w["code"] for w in watch} | {h["code"] for h in pf["holdings"]})
     news_today = [n for n in news.latest(200, codes=my_codes) if n["news_date"] == trade_date] if my_codes else []
     news_count = db.scalar("SELECT COUNT(*) FROM news WHERE news_date=%s", (trade_date,))
+    trade_signals = {}
+    try:
+        from . import tradeplan
+
+        if predict.latest_date() == trade_date:
+            ap = tradeplan.all_plans()
+            keep = ("code", "name", "close", "signal", "buy_zone", "stop", "t1", "t2", "rr2", "win_rate", "ev_pct", "reasons")
+            trade_signals = {
+                "counts": ap["counts"],
+                "buy": [{k: p[k] for k in keep} for p in ap["buy"][:10]],
+                "accumulate": [{k: p[k] for k in keep} for p in ap["accumulate"][:10]],
+                "holdings": [{**{k: p[k] for k in keep}, "trailing_stop": (p["holding"] or {}).get("trailing_stop")}
+                             for p in ap["holdings"]],
+                "record": ap["tables"].get("buy_record"),
+                "regime": ap.get("regime"),
+                "paper": {k: v for k, v in tradeplan.signal_record(0).items() if k != "rows"},
+            }
+    except Exception:
+        log.exception("Could not add trade signals to the report")
     picks_short, picks_long = [], []
     try:
         if predict.latest_date() == trade_date:
@@ -134,6 +153,7 @@ def build(trade_date: date) -> dict[str, Any]:
     except Exception:  # the report must never fail because of the model
         log.exception("Could not add picks to the report")
     return {
+        "trade_signals": trade_signals,
         "forecast_check": checks,
         "news_mine": [{k: n[k] for k in ("code", "news_time", "type", "summary", "tags", "tone")} for n in news_today[:20]],
         "news_count": news_count,
@@ -204,7 +224,19 @@ def headline(rep: dict) -> tuple[str, str]:
         lines.append(f"Forecast check: {fc['in68']:.0f}% of next-session ranges held (target 68%)")
     if rep.get("news_mine"):
         lines.append("News: " + ", ".join(sorted({n["code"] for n in rep["news_mine"]}))[:120])
-    if rep.get("picks_short"):
+    ts = rep.get("trade_signals") or {}
+    if ts.get("regime"):
+        lines.append(f"Market regime: {ts['regime']}")
+    paper = ts.get("paper") or {}
+    if paper.get("closed"):
+        lines.append(f"Paper trades: {paper['closed']} closed, target hit {paper['win_rate']:.0f}%, "
+                     f"avg {paper['avg_return']:+.2f}% per trade")
+    act = [h for h in ts.get("holdings", []) if h["signal"] in ("SELL", "TAKE PROFIT")]
+    if act:
+        lines.append("Your holdings: " + ", ".join(f"{h['code']} {h['signal']}" for h in act[:6]))
+    if ts.get("buy"):
+        lines.append("BUY signals: " + ", ".join(x["code"] for x in ts["buy"][:5]))
+    elif rep.get("picks_short"):
         lines.append("Short-term ideas: " + ", ".join(x["code"] for x in rep["picks_short"][:5]))
     if rep.get("alerts"):
         lines.append(

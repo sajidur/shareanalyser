@@ -121,6 +121,74 @@ has never seen. Code: `bdstock/predict.py`.
   can show the **50% (narrowest, default)**, 68% or 90% range. In tests the next-session 50% range was
   about 2.6% wide and held about 50% of the time, against 4.1% wide / 67% for the 68% range.
 
+### Bangladesh factors (BD factors page)
+
+Measured on DSE history every day; only effects with real evidence change the buy/sell signals.
+
+* **Event studies:** how shares did (median, vs the equal-weight market, next 1/5/20 sessions) after
+  DSE queries on unusual price/volume (rumour / manipulation footprint), company clarifications of
+  media reports (rumours), sponsor/director buy and sell declarations, downgrade to / upgrade from
+  category Z, margin-loan bans, regulator actions, government / state / Bangladesh Bank involvement,
+  circuit days and record dates. First results (Oct 2025 – Nov 2026): downgrade to Z and margin-loan
+  bans **−8.7%** (strong), rumour clarifications **−3.5%** (moderate), record dates −2.9% (strong, the
+  dividend drop). DSE queries, insider declarations and government news had no reliable effect.
+* **Market regime** (Calm / Nervous / Stress / Euphoric) from breadth, turnover, drawdown and
+  volatility. This is the footprint of political and macro shocks. After Stress days the market fell on
+  average, so new BUY signals wait in Stress.
+* **Political / regulatory events:** elections from DSE's holiday list plus events you record; the
+  market's reaction around each is measured.
+* **Pump-and-dump risk score** (small cap, low free float, Z, run-up, circuit days, volume spike, DSE
+  query). High-risk shares were a lottery: typically −3.4% vs the market, but 1 in 10 more than doubled.
+  BUY signals skip them.
+* **Paper trading:** every BUY signal is logged and followed with real prices (fill, stop, target,
+  time exit, after commission). See the live record on the Prediction and Accuracy pages before
+  trusting real money.
+
+Political influence is measured only through its footprint in prices and disclosures. No company is
+labelled as politically connected.
+
+### Short-term and long-term date ranges
+
+* **Short term** (trading): next session, 1 week, 1 month, e.g. 24 Nov – 22 Dec 2026.
+* **Long term** (investing): 3 months, 6 months, 1 year, e.g. to 2 Dec 2027. The 6-month and 1-year
+  ranges are estimates (the 3-month range extended with √time). One year of history cannot test them,
+  and the page labels them so.
+* Every forecast and plan shows real calendar dates. Trading days skip Fridays, Saturdays and DSE
+  holidays (read daily from dse.com.bd/holidays; next year's moon-based holidays are projected about
+  11 days earlier).
+* The trade plan gives a **short-term trade window** (buy date, Target 1 by, Target 2 by, exit/review by)
+  and a **long-term plan** (accumulate until, 6-month review date, 1-year horizon with ranges).
+* **Range for a date:** pick any trading day up to a year ahead to see its likely range.
+
+### Trade plan (buy / sell parameters)
+
+Every share gets a plan on its Prediction page, and the overview lists today's signals:
+
+| Parameter | How it is set |
+|---|---|
+| **Signal** | BUY (uptrend pullback + reward:risk ≥ 1.5 + positive historical EV + liquid, not Z) · ACCUMULATE (long-term score ≥ 70) · HOLD / TAKE PROFIT / SELL for your holdings · AVOID (downtrend, seriously negative news, illiquid) · WAIT |
+| **Buy zone** | limit prices with about a 50% / 70% chance of being filled next session (measured next-day lows) |
+| **Sell zone** | limit prices the next session reaches about 50% / 30% of the time (measured next-day highs) |
+| **Stop-loss** | price − 1.5 × ATR(14); holders get a trailing stop = highest close since buying − 2.5 × ATR |
+| **Targets** | T1 = top of the 1-week 50% range, T2 = top of the 1-month 68% range |
+| **Win rate / EV** | from every liquid share's daily highs/lows in the past year: how often T2 was reached before the stop within 20 sessions, and the average result per trade |
+| **Position size** | shares = min(capital × risk% ÷ (entry − stop), capital × max% ÷ entry). Set capital and risk in Settings |
+| **Live today's close** | during market hours: likely range for today's close from the live price, narrowing as the session runs out |
+
+Measured record of the rules over the past year: BUY trades reached the target first 33% of the time,
+were stopped 49%, averaged **+1.10% per trade vs +0.57%** for random entries with the same exits
+(about 10 sessions held). Twenty sessions after a SELL signal, shares averaged −0.30% vs +1.41% for
+all shares. Win rates are below 50% by design (winners are larger than losers), so the stop matters.
+
+### Local AI (Ollama)
+
+If Ollama is running (`config.ini` [ollama], default model `gemma3:4b`), the tool uses it locally to
+(1) rate each non-routine announcement from −2 to +2. This becomes the "AI news score" model input and is
+tested like every other input. The end-of-day run spends up to `ai_daily_minutes` (Settings) on new news,
+and Settings has a button to rate the backlog. (2) It writes a plain-language analyst note on any
+stock's Prediction page from the numbers already computed. The AI never sets ranges or signals, and
+small local models can misread facts, so the numbers on the page are what count.
+
 ### Formulas
 
 ```text
@@ -189,6 +257,9 @@ bdstock/alerts.py           alert rules (intraday + end of day)
 bdstock/portfolio.py        transactions, average-cost holdings, P/L
 bdstock/predict.py          forecasts, backtests, input-group tests, daily accuracy checks, top-10 lists
 bdstock/news.py             DSE announcements: collection, tagging, point-in-time news features
+bdstock/tradeplan.py        trade plans: signals, buy/sell zones, stops, targets, win rate, position size
+bdstock/llm.py              local Ollama: AI news scoring and analyst notes
+bdstock/bdfactors.py        Bangladesh factors: event studies, market regime, political/regulatory events, pump risk
 bdstock/report.py           daily report
 bdstock/notifier.py         Windows toast + Telegram
 bdstock/monitor.py          background market monitor inside the web server

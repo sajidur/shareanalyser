@@ -172,7 +172,8 @@ def fetch_latest() -> list[str]:
 
 
 def latest(limit: int = 30, code: str | None = None, codes: list[str] | None = None) -> list[dict]:
-    sql = "SELECT n.code, i.name, n.news_date, n.news_time, n.type, n.summary, n.body, n.tags, n.tone, n.eps_growth, n.record_date FROM news n LEFT JOIN instruments i ON i.code=n.code"
+    sql = ("SELECT n.code, i.name, n.news_date, n.news_time, n.type, n.summary, n.body, n.tags, n.tone, n.eps_growth, "
+           "n.record_date, n.ai_impact, n.ai_reason FROM news n LEFT JOIN instruments i ON i.code=n.code")
     params: list = []
     if code:
         sql += " WHERE n.code=%s"
@@ -191,19 +192,19 @@ def latest(limit: int = 30, code: str | None = None, codes: list[str] | None = N
 # ---------------------------------------------------------------------------- features
 
 def load_events() -> dict[str, list[tuple]]:
-    """code -> [(news_date, tone, eps_growth, has_dividend, has_no_dividend, record_date)] sorted by date."""
+    """code -> [(news_date, tone, eps_growth, has_dividend, has_no_dividend, record_date, ai_impact)]."""
     out: dict[str, list[tuple]] = defaultdict(list)
-    for r in db.query("SELECT code, news_date, tone, eps_growth, tags, record_date FROM news ORDER BY code, news_date"):
+    for r in db.query("SELECT code, news_date, tone, eps_growth, tags, record_date, ai_impact FROM news ORDER BY code, news_date"):
         tags = (r["tags"] or "").split(",")
         out[r["code"]].append((r["news_date"], r["tone"] or 0.0, r["eps_growth"], "dividend" in tags,
-                               "no_dividend" in tags, r["record_date"]))
+                               "no_dividend" in tags, r["record_date"], r["ai_impact"]))
     return out
 
 
 def features(dates: list[date], events: list[tuple]) -> dict[str, list[float]]:
     """Point-in-time news features for each date (uses only announcements dated on/before it)."""
     n = len(dates)
-    out = {k: [0.0] * n for k in ("news_cnt", "news_tone", "eps_surprise", "div_event", "record_soon")}
+    out = {k: [0.0] * n for k in ("news_cnt", "news_tone", "eps_surprise", "div_event", "record_soon", "ai_news")}
     if not events:
         return out
     ev_dates = [e[0] for e in events]
@@ -221,6 +222,7 @@ def features(dates: list[date], events: list[tuple]) -> dict[str, list[float]]:
                 out["eps_surprise"][i] = e[2]
                 break
         recent = events[lo30:hi]
+        out["ai_news"][i] = max(-4.0, min(4.0, float(sum(e[6] or 0 for e in recent if len(e) > 6))))
         if any(e[4] for e in recent):
             out["div_event"][i] = -1.0
         elif any(e[3] for e in recent):

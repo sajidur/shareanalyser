@@ -30,6 +30,7 @@ DEFAULTS = {
         "backfill_delay_seconds": "0.8",
     },
     "dse": {"base_url": "https://www.dse.com.bd", "timeout_seconds": "30"},
+    "ollama": {"enabled": "1", "host": "http://127.0.0.1:11434", "model": "gemma3:4b", "timeout_seconds": "180"},
 }
 
 _cache: configparser.ConfigParser | None = None

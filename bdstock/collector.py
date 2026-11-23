@@ -154,6 +154,17 @@ def update_recent_market() -> int:
     return len(rows)
 
 
+def update_holidays() -> int:
+    """Keep DSE's published holiday list (by year) for trading-day calendars."""
+    h = dse.fetch_holidays()
+    if not h["holidays"]:
+        return 0
+    state = db.get_state("holidays") or {}
+    state[str(h["year"])] = h["holidays"]
+    db.set_state("holidays", state)
+    return len(h["holidays"])
+
+
 def update_pe() -> int:
     pe = dse.fetch_pe()
     db.executemany("UPDATE instruments SET trailing_pe=%s WHERE code=%s", [(v, k) for k, v in pe.items()])
@@ -199,6 +210,7 @@ def run_daily(force: bool = False, notify: bool = True, progress: Progress = Non
             store_eod(snap)
             _safe(update_recent_market, "Recent market history")
             _safe(update_pe, "P/E update")
+            _safe(update_holidays, "Holiday list")
             news_codes = _safe(news.fetch_latest, "News") or []
             gaps = gap_dates()
             if gaps:
@@ -210,7 +222,15 @@ def run_daily(force: bool = False, notify: bool = True, progress: Progress = Non
                     "SELECT DISTINCT code FROM news WHERE news_date=%s", (snap.trade_date,))]
                 _safe(lambda: refresh_news_companies(sorted(set(news_codes) | set(todays))), "News company refresh")
             analyzed = analysis.analyze_all(snap.trade_date)
+            from . import llm, settings as user_settings
+
+            _safe(lambda: llm.score_news(days=120, max_minutes=user_settings.get_float("ai_daily_minutes")),
+                  "AI news scoring")
             _safe(lambda: predict.run(snap.trade_date), "Prediction model")
+            from . import bdfactors, tradeplan
+
+            _safe(bdfactors.build, "Bangladesh factors")
+            _safe(lambda: tradeplan.update_signal_log(snap.trade_date), "Paper-trading log")
             events = alerts.check_eod(snap.trade_date)
             rep = report.build(snap.trade_date)
             report.save(snap.trade_date, rep)

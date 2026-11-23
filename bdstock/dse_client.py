@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -207,8 +207,20 @@ def parse_snapshot(d: dict) -> Snapshot:
     )
 
 
-def fetch_snapshot() -> Snapshot:
-    return parse_snapshot(_get("/api/live/snapshot"))
+def fetch_snapshot(retries: int = 3) -> Snapshot:
+    """The DSE feed occasionally returns an empty price list for a moment (seen once after hours);
+    retry a few times before giving up."""
+    last: DSEError | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return parse_snapshot(_get("/api/live/snapshot"))
+        except DSEError as e:
+            last = e
+            if "no price rows" not in str(e) or attempt == retries:
+                raise
+            log.warning("Snapshot had no price rows (attempt %d/%d); retrying", attempt, retries)
+            time.sleep(10 * attempt)
+    raise last  # pragma: no cover
 
 
 # --------------------------------------------------------------------------- page data
@@ -360,6 +372,54 @@ def parse_news_page(html: str) -> list[dict]:
 
 def fetch_news() -> list[dict]:
     return parse_news_page(_get("/news", as_json=False))
+
+
+def _month(name: str) -> int:
+    return datetime.strptime(name.strip()[:3].title(), "%b").month
+
+
+def expand_holiday(text: str, year: int) -> list[date]:
+    """'04 February', '11-12 February', '17 March - 23 March', '20-22 October' -> list of dates."""
+    s = re.sub(r"\s+", " ", text.strip())
+    m = re.fullmatch(r"(\d{1,2}) ?- ?(\d{1,2}) ([A-Za-z]+)", s)
+    if m:
+        start, end = date(year, _month(m.group(3)), int(m.group(1))), date(year, _month(m.group(3)), int(m.group(2)))
+    else:
+        m = re.fullmatch(r"(\d{1,2}) ([A-Za-z]+) ?- ?(\d{1,2}) ([A-Za-z]+)", s)
+        if m:
+            start = date(year, _month(m.group(2)), int(m.group(1)))
+            end = date(year, _month(m.group(4)), int(m.group(3)))
+        else:
+            m = re.fullmatch(r"(\d{1,2}) ([A-Za-z]+)", s)
+            if not m:
+                return []
+            start = end = date(year, _month(m.group(2)), int(m.group(1)))
+    out, d = [], start
+    while d <= end:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def parse_holidays_page(html: str) -> dict:
+    """DSE holiday list for the calendar year shown on https://www.dse.com.bd/holidays."""
+    text = rsc_text(html)
+    m = re.search(r"Calendar Year (\d{4})", text)
+    year = int(m.group(1)) if m else date.today().year
+    rows = extract_json(text, "rows", "[", lambda v: isinstance(v, list) and bool(v) and isinstance(v[0], dict)
+                        and "days" in v[0] and "date" in v[0]) or []
+    out = []
+    for r in rows:
+        try:
+            days = expand_holiday(str(r.get("date") or ""), year)
+        except ValueError:
+            continue
+        out.extend({"date": d.isoformat(), "name": r.get("name"), "moon": bool(r.get("moon"))} for d in days)
+    return {"year": year, "holidays": out}
+
+
+def fetch_holidays() -> dict:
+    return parse_holidays_page(_get("/holidays", as_json=False))
 
 
 def parse_pe_page(html: str) -> dict[str, float | None]:

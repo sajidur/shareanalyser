@@ -50,6 +50,12 @@ from . import analysis, db, indicators as ind, news, settings
 log = logging.getLogger(__name__)
 
 HORIZONS: dict[int, str] = {1: "Next session", 5: "1 week", 20: "1 month", 60: "3 months"}
+# Long horizons cannot be trained or tested with ~1 year of DSE history: their ranges extend the
+# 3-month range with sqrt(time) and are labelled as estimates.
+LONG_HORIZONS: dict[int, str] = {120: "6 months", 245: "1 year"}
+ALL_HORIZONS: dict[int, str] = {**HORIZONS, **LONG_HORIZONS}
+SHORT_TERM = (1, 5, 20)
+LONG_TERM = (60, 120, 245)
 
 # key, plain-language label, value format, input group
 FEATURES: list[tuple[str, str, str, str]] = [
@@ -84,6 +90,7 @@ FEATURES: list[tuple[str, str, str, str]] = [
     ("eps_surprise", "Latest earnings vs last year", "growth", "news"),
     ("div_event", "Dividend news (last 30 days)", "event", "news"),
     ("record_soon", "Record date within 10 days", "flag", "news"),
+    ("ai_news", "AI news score (30 days, local LLM)", "ai", "news"),
     ("clv5", "Close position in day's range (5d)", "clv", "activity"),
     ("gap", "Opening gap", "ret", "activity"),
     ("hl5", "Intraday high-low range (5d)", "pct", "activity"),
@@ -102,6 +109,12 @@ FEATURES: list[tuple[str, str, str, str]] = [
     ("free_float", "Free float", "share", "ownership"),
     ("dow_sun", "Sunday session (after weekend)", "flag", "calendar"),
     ("dow_thu", "Thursday session (before weekend)", "flag", "calendar"),
+    ("bd_query", "DSE query on unusual price/volume (recent)", "decay", "bangladesh"),
+    ("bd_rumour", "Rumour / media clarification (recent)", "decay", "bangladesh"),
+    ("bd_sponsor", "Sponsor/director net buy declarations (30d)", "signed", "bangladesh"),
+    ("bd_toz", "Downgraded to category Z (60d)", "flag", "bangladesh"),
+    ("bd_margin", "Margin loans prohibited", "flag", "bangladesh"),
+    ("bd_govt", "Government / regulator news (30d)", "count", "bangladesh"),
 ]
 FEATURE_KEYS = [f[0] for f in FEATURES]
 GROUPS: dict[str, list[int]] = defaultdict(list)
@@ -110,12 +123,13 @@ for _i, _f in enumerate(FEATURES):
 GROUP_LABELS = {"technical": "Price & volume (technical)", "liquidity": "Liquidity & DSE category",
                 "market": "Market conditions", "sector": "Sector strength", "fundamentals": "Fundamentals",
                 "news": "News & announcements", "activity": "Trading activity", "risk": "Risk (beta, 52-week)",
-                "ownership": "Ownership & size", "calendar": "Day of week"}
+                "ownership": "Ownership & size", "calendar": "Day of week",
+                "bangladesh": "Bangladesh factors (rumour, insiders, regulator, government)"}
 WARMUP = 60
 MIN_TRAIN_ROWS = 2000
 LIQUID_MN = 5.0          # Tk million average daily traded value: "liquid enough to trade"
-QUANTILES = (5, 16, 25, 50, 75, 84, 95)
-BANDS = {50: ("q25", "q75"), 68: ("q16", "q84"), 90: ("q5", "q95")}
+QUANTILES = (5, 16, 25, 35, 50, 65, 75, 84, 95)
+BANDS = {30: ("q35", "q65"), 50: ("q25", "q75"), 68: ("q16", "q84"), 90: ("q5", "q95")}
 # inputs of the volatility (range-width) model: names for the formula card
 VOL_INPUTS = ["log 5-day volatility", "log 20-day volatility", "log 60-day volatility", "log ATR %",
               "log intraday high-low range", "idle days", "liquidity", "log price (tick size)",
@@ -178,12 +192,55 @@ def _r(x: float | None, nd: int = 2) -> float | None:
     return None if x is None or not math.isfinite(x) else round(x, nd)
 
 
-def next_trading_days(start: date, n: int) -> list[date]:
-    """DSE trades Sunday-Thursday (Friday/Saturday weekend). Public holidays are not known."""
+_HOLIDAYS: dict[str, Any] = {"loaded_at": 0.0, "data": None}
+
+
+def _holiday_data() -> dict:
+    import time as _t
+
+    if _HOLIDAYS["data"] is None or _t.time() - _HOLIDAYS["loaded_at"] > 600:
+        try:
+            _HOLIDAYS["data"] = db.get_state("holidays") or {}
+        except Exception:  # no database (e.g. offline tests): weekends only
+            _HOLIDAYS["data"] = {}
+        _HOLIDAYS["loaded_at"] = _t.time()
+    return _HOLIDAYS["data"]
+
+
+def holiday_dates(years: range, data: dict | None = None) -> set[date]:
+    """DSE holidays for the given years. Years DSE has not published yet are projected from the
+    nearest published year: fixed-date holidays keep their date; moon-based ones (Eid, Shab-e-Barat,
+    ...) move ~11 days earlier per year, following the Islamic calendar."""
+    data = _holiday_data() if data is None else data
+    if not data:
+        return set()
+    known = sorted(int(y) for y in data)
+    out: set[date] = set()
+    for y in years:
+        if str(y) in data:
+            out |= {date.fromisoformat(h["date"]) for h in data[str(y)]}
+            continue
+        base = max(known) if y > max(known) else min(known)
+        shift = (y - base) * 11
+        for h in data[str(base)]:
+            d0 = date.fromisoformat(h["date"])
+            try:
+                d = d0.replace(year=y)
+            except ValueError:  # 29 Feb
+                continue
+            out.add(d - timedelta(days=shift) if h.get("moon") else d)
+    return out
+
+
+def next_trading_days(start: date, n: int, holidays: set[date] | None = None) -> list[date]:
+    """DSE trades Sunday-Thursday (Friday/Saturday weekend), minus DSE holidays
+    (published list; later years projected)."""
+    if holidays is None:
+        holidays = holiday_dates(range(start.year, start.year + 3))
     out, d = [], start
     while len(out) < n:
         d += timedelta(days=1)
-        if d.weekday() not in (4, 5):
+        if d.weekday() not in (4, 5) and d not in holidays:
             out.append(d)
     return out
 
@@ -211,6 +268,12 @@ def fmt_feature(kind: str, x: float) -> str:
         return "Yes" if x >= 0.5 else "No"
     if kind == "yield":
         return f"{x * 100:.1f}%"
+    if kind == "ai":
+        return f"{x:+.0f} (AI-rated news)" if x else "no rated news"
+    if kind == "decay":
+        return "recent" if x > 0.05 else "none"
+    if kind == "signed":
+        return f"{x:+.0f}"
     if kind == "clv":
         return "near day's high" if x > 0.3 else "near day's low" if x < -0.3 else "mid-range"
     if kind == "streak":
@@ -458,6 +521,9 @@ def build_dataset() -> dict[str, Any]:
     infos = {r["code"]: r for r in db.query(
         "SELECT code, face_value, year_end, extra_json, paid_up_capital, free_float FROM company_info")}
     events = news.load_events()
+    from . import bdfactors
+
+    bd_events = bdfactors.load_news_events()
     stocks = {}
     mkt: dict[int, list[tuple[float, float]]] = defaultdict(list)
     sect: dict[tuple[int, str], list[float]] = defaultdict(list)
@@ -470,7 +536,7 @@ def build_dataset() -> dict[str, Any]:
         if len(c) < WARMUP + 5:
             continue
         f = stock_features(c, h, lo, v, o, tr)
-        stocks[code] = {"f": f, "c": c, "v": v, "di": di, "dates": s["dates"], "sector": s["sector"],
+        stocks[code] = {"f": f, "c": c, "v": v, "h": h, "lo": lo, "di": di, "dates": s["dates"], "sector": s["sector"],
                         "category": s["category"], "asset_type": s["asset_type"]}
         liquid = (f["_liq_mn"] >= 1.0) & (v > 0)
         r1 = f["r1"]
@@ -535,6 +601,7 @@ def build_dataset() -> dict[str, Any]:
         f["cat_z"] = np.full(n, 1.0 if st["category"] == "Z" else 0.0)
         f.update(fundamental_features(st["dates"], st["c"], fundamental_points(infos.get(code))))
         f.update({k: np.array(v) for k, v in news.features(st["dates"], events.get(code, [])).items()})
+        f.update({k: np.array(v) for k, v in bdfactors.event_features(st["dates"], bd_events.get(code, [])).items()})
         st["X"] = np.column_stack([f[k] for k in FEATURE_KEYS])
         e = 1e-4
         st["V"] = np.column_stack([
@@ -864,8 +931,8 @@ def rule_backtest(ds: dict) -> dict:
 # ============================================================================ daily run
 
 PRED_INSERT = """INSERT INTO predictions (code, trade_date, horizon, close, prob_up, exp_ret, sigma,
-    median, low50, high50, low68, high68, low90, high90, atr, liq_mn, hist_up, drivers, source)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+    median, low30, high30, low50, high50, low68, high68, low90, high90, atr, liq_mn, hist_up, drivers, source)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
 
 
 def _hist_up(c: np.ndarray, h: int, window: int = 250) -> float | None:
@@ -901,10 +968,32 @@ def _predict_row(code: str, model: Model, ranger: Ranger, st: dict, t: int, h: i
 
     return (
         code, day, h, close, round(float(prob[0]), 4), round(math.expm1(float(ret[0])) * 100, 3),
-        float(sigma), px("q50"), px("q25"), px("q75"), px("q16"), px("q84"), px("q5"), px("q95"),
+        float(sigma), px("q50"), px("q35"), px("q65"), px("q25"), px("q75"), px("q16"), px("q84"), px("q5"), px("q95"),
         float(atr) if np.isfinite(atr) else None, float(liq) if np.isfinite(liq) else None,
         _hist_up(st["c"][: t + 1], h) if explain else None, json.dumps(drivers), source,
     )
+
+
+def _long_rows(code: str, ranger: Ranger, st: dict, t: int, base_h: int, day: date) -> list[tuple]:
+    """6-month / 1-year range estimates: the base (3-month) scale grown with sqrt(time), same
+    measured shape. No direction model (prob/expected return left empty)."""
+    s_base, q = ranger.at(st, t)
+    close = float(st["c"][t])
+    atr, liq = st["f"]["_atr"][t], st["f"]["_liq_mn"][t]
+    rows = []
+    for lh in LONG_HORIZONS:
+        s = s_base * math.sqrt(lh / base_h)
+
+        def px(k: str) -> float:
+            return round(close * math.exp(q[k] * s), 2)
+
+        rows.append((
+            code, day, lh, close, None, None, s / math.sqrt(lh),
+            px("q50"), px("q35"), px("q65"), px("q25"), px("q75"), px("q16"), px("q84"), px("q5"), px("q95"),
+            float(atr) if np.isfinite(atr) else None, float(liq) if np.isfinite(liq) else None,
+            _hist_up(st["c"][: t + 1], lh), "[]", "live",
+        ))
+    return rows
 
 
 def run(trade_date: date | None = None, group_test: bool = True) -> dict:
@@ -942,9 +1031,8 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
         ranges = range_evaluate(rows, h)
         chosen = ranges["methods"].get(ranges["method"], {})
         if backtest and chosen:
-            backtest.update({"range50_hit": chosen.get("in50"), "range68_hit": chosen.get("in68"),
-                             "range90_hit": chosen.get("in90"), "width50": chosen.get("width50"),
-                             "width68": chosen.get("width68"), "width90": chosen.get("width90")})
+            backtest.update({f"range{lv}_hit": chosen.get(f"in{lv}") for lv in BANDS})
+            backtest.update({f"width{lv}": chosen.get(f"width{lv}") for lv in BANDS})
         model = Model().fit(rows["X"], rows["y"])
         ranger = Ranger(ranges["method"], rows, h)
         meta["horizons"][str(h)] = {
@@ -959,6 +1047,11 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
             row = _predict_row(code, model, ranger, st, len(st["c"]) - 1, h, trade_date, "live")
             if row:
                 out_rows.append(row)
+                if h == max(HORIZONS):
+                    out_rows.extend(_long_rows(code, ranger, st, len(st["c"]) - 1, h, trade_date))
+    for lh, label in LONG_HORIZONS.items():
+        meta["horizons"][str(lh)] = {"label": label, "available": True, "extrapolated": True,
+                                     "from_horizon": max(HORIZONS), "reliable": False}
     db.execute("DELETE FROM predictions WHERE trade_date=%s", (trade_date,))
     db.executemany(PRED_INSERT, out_rows)
     meta["predicted"] = len({r[0] for r in out_rows})
@@ -966,6 +1059,12 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
     if not db.scalar("SELECT COUNT(*) FROM predictions WHERE source='backtest' AND low50 IS NOT NULL"):
         meta["simulated"] = simulate_history(ds, methods=methods)  # first run: build a walk-forward record
     meta["checks"] = run_checks()
+    try:
+        from . import tradeplan
+
+        tradeplan.build_tables(ds)
+    except Exception as e:  # trade tables are an add-on; never fail the forecast run
+        log.warning("Trade tables failed: %s", e)
     meta["seconds"] = round((datetime.now() - started).total_seconds(), 1)
     db.set_state("predict_model", meta)
     try:
@@ -1082,7 +1181,8 @@ def _matured(rows: list[dict], cal: list[date]) -> list[dict]:
             continue
         r["actual"] = actual
         r["actual_ret"] = round((actual / r["close"] - 1) * 100, 2)
-        r["hit"] = None if actual == r["close"] else (actual > r["close"]) == (r["prob_up"] > 0.5)
+        r["hit"] = (None if actual == r["close"] or r.get("prob_up") is None
+                    else (actual > r["close"]) == (r["prob_up"] > 0.5))
         r["in68"] = r["low68"] <= actual <= r["high68"]
         r["in90"] = (r.get("low90") or r["low68"]) <= actual <= (r.get("high90") or r["high68"])
         r["in50"] = (r["low50"] <= actual <= r["high50"]) if r.get("low50") is not None else None
@@ -1133,7 +1233,7 @@ def accuracy_overview(days: int = 120) -> dict:
         (days,),
     )
     totals = {}
-    for h in HORIZONS:
+    for h in ALL_HORIZONS:
         for src in ("live", "backtest"):
             rs = [r for r in rows if r["horizon"] == h and r["source"] == src]
             if not rs:
@@ -1183,7 +1283,7 @@ def accuracy_details(check_date: date, horizon: int) -> dict:
             "error_pct": round((act - p["median"]) / p["close"] * 100, 2),
             "in50": (p["low50"] <= act <= p["high50"]) if p["low50"] is not None else None,
             "in68": p["low68"] <= act <= p["high68"], "in90": p["low90"] <= act <= p["high90"],
-            "dir_hit": None if act == p["close"] else (act > p["close"]) == (p["prob_up"] > 0.5),
+            "dir_hit": None if act == p["close"] or p["prob_up"] is None else (act > p["close"]) == (p["prob_up"] > 0.5),
         })
     return {"made_on": made_on, "check_date": check_date, "horizon": horizon, "rows": out}
 
@@ -1209,7 +1309,7 @@ def forecast(code: str) -> dict | None:
     hz = m.get("horizons", {})
     by_h = {r["horizon"]: r for r in rows}
     close, sigma = rows[0]["close"], rows[0]["sigma"] or 0.02
-    edges = ("median", "low50", "high50", "low68", "high68", "low90", "high90")
+    edges = ("median", "low30", "high30", "low50", "high50", "low68", "high68", "low90", "high90")
     # cone: interpolate each band edge (as a log move) between the forecast horizons, in sqrt(time)
     knots = [(0, {e: 0.0 for e in edges})]
     for h in sorted(by_h):
@@ -1223,22 +1323,33 @@ def forecast(code: str) -> dict | None:
         w = (math.sqrt(k) - math.sqrt(k0)) / (math.sqrt(k1) - math.sqrt(k0)) if k1 > k0 else 1.0
         cone.append({"time": day, **{e: round(close * math.exp(a[e] + (b[e] - a[e]) * w), 2) for e in edges}})
     horizons = []
-    for h, label in HORIZONS.items():
+    for h, label in ALL_HORIZONS.items():
         r = by_h.get(h)
         if not r:
             continue
         info = hz.get(str(h), {})
         horizons.append({
             "h": h, "label": label, "target_date": days[h - 1] if h <= len(days) else None,
-            "median": r["median"], "low50": r.get("low50"), "high50": r.get("high50"),
+            "term": "short" if h in SHORT_TERM else "long", "extrapolated": h in LONG_HORIZONS,
+            "median": r["median"], "low30": r.get("low30"), "high30": r.get("high30"),
+            "low50": r.get("low50"), "high50": r.get("high50"),
             "low68": r["low68"], "high68": r["high68"], "low90": r["low90"], "high90": r["high90"],
             "prob_up": r["prob_up"], "exp_ret": r["exp_ret"], "hist_up": r["hist_up"],
             "reliable": bool(info.get("reliable")), "backtest": info.get("backtest"),
             "range_method": info.get("range_method"),
             "drivers": json.loads(r["drivers"] or "[]"),
         })
+    def span(hs: tuple) -> dict | None:
+        ks = [h for h in hs if h in by_h]
+        if not ks:
+            return None
+        return {"from": days[0], "to": days[max(ks) - 1], "horizons": [ALL_HORIZONS[h] for h in ks]}
+
+    short_span, long_span = span(SHORT_TERM), span(LONG_TERM)
+    if long_span:  # long term starts where short term ends
+        long_span["from"] = days[min(len(days), max(SHORT_TERM) + 1) - 1]
     return {"trade_date": d, "close": close, "sigma": sigma, "atr": rows[0]["atr"], "liq_mn": rows[0]["liq_mn"],
-            "horizons": horizons, "cone": cone}
+            "horizons": horizons, "cone": cone, "date_ranges": {"short": short_span, "long": long_span}}
 
 
 def _dividend_years(div_history: list[dict]) -> tuple[int, int]:
@@ -1352,6 +1463,7 @@ def _long_term(preds: dict, sigs: dict, inst: dict, info: dict, model_reliable: 
             "eps_growth": _r(c["growth"] * 100, 1) if c["growth"] is not None else None,
             "volatility": _r(c["vol"] * 100, 1), "trend": c["trend"] >= 1,
             "range_3m": [ph[60]["low68"], ph[60]["high68"]] if 60 in ph else None,
+            "range_1y": [ph[245]["low50"], ph[245]["high50"]] if 245 in ph and ph[245].get("low50") else None,
             "components": {"valuation": round(valuation * 100), "dividends": round(dividends * 100),
                            "growth": round(growth * 100), "stability": round(stability * 100)},
             "liq_mn": _r(c["liq"], 1), "label": s.get("label"), "signal_score": s.get("score"),
@@ -1377,6 +1489,7 @@ def picks(limit: int = 10) -> dict:
     inst = {r["code"]: r for r in db.query("SELECT code, name, sector, category, asset_type, trailing_pe FROM instruments")}
     info = {r["code"]: r for r in db.query("SELECT * FROM company_info")}
     circuit = settings.get_float("circuit_pct")
+    days_ahead = next_trading_days(d, 245)
 
     short = []
     for code, ph in preds.items():
@@ -1397,6 +1510,7 @@ def picks(limit: int = 10) -> dict:
             "stop": round(stop, 2), "target": round(target, 2), "reward_risk": _r(rr, 2),
             "range_1w": [ph[5]["low68"], ph[5]["high68"]] if 5 in ph else None,
             "range_1m": [p20["low68"], p20["high68"]],
+            "hold_until": days_ahead[19] if days_ahead else None,
             "prob_1m": p20["prob_up"], "model_reliable": reliable20,
         })
     if reliable20:
@@ -1414,6 +1528,10 @@ def picks(limit: int = 10) -> dict:
             break
     return {
         "trade_date": d, "short": short[:limit], "long": chosen,
+        "date_ranges": {
+            "short": {"from": days_ahead[0], "to": days_ahead[19]},
+            "long": {"accumulate_to": days_ahead[59], "review": days_ahead[119], "to": days_ahead[244]},
+        },
         "short_candidates": len(short), "long_candidates": len(long_),
         "liquid_mn": LIQUID_MN, "short_ranked_by": "model" if reliable20 else "trend strength",
     }

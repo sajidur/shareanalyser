@@ -14,6 +14,11 @@ DEFAULTS: dict[str, str] = {
     "telegram_chat_id": "",
     "intraday_alerts": "1",
     "dashboard_url": "http://127.0.0.1:8050",
+    # position sizing for trade plans
+    "capital": "0",              # Tk available for trading (0 = do not size positions)
+    "risk_pct": "1.0",           # max % of capital lost if a stop-loss is hit
+    "max_position_pct": "20",    # max % of capital in one share
+    "ai_daily_minutes": "10",    # time budget for AI news scoring in the end-of-day run
 }
 
 

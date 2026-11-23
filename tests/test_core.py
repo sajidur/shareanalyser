@@ -3,6 +3,7 @@ Run:  python -m unittest discover -s tests -v"""
 from __future__ import annotations
 
 import json
+import math
 import sys
 import unittest
 from datetime import date, datetime
@@ -36,6 +37,18 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(untraded["close"] and untraded["open"] == untraded["close"] == untraded["high"])
         self.assertEqual({i["key"] for i in snap.indices}, {"DSEX", "DS30", "DSES"})
         self.assertTrue(snap.daily_totals)
+
+    def test_snapshot_retries_empty_feed(self):
+        from unittest import mock
+
+        good = json.loads(read("snapshot.json"))
+        empty = {"market": good["market"], "prices": {"cols": good["prices"]["cols"], "rows": []}}
+        with mock.patch.object(dse, "_get", side_effect=[empty, good]), mock.patch.object(dse.time, "sleep"):
+            snap = dse.fetch_snapshot()
+        self.assertGreater(len(snap.quotes), 600)
+        with mock.patch.object(dse, "_get", side_effect=[empty, empty, empty]), mock.patch.object(dse.time, "sleep"):
+            with self.assertRaises(dse.DSEError):
+                dse.fetch_snapshot()
 
     def test_trade_date_falls_back_to_session(self):
         self.assertEqual(dse._parse_trade_date(None, {"sessionDate": "2026-11-19"}), date(2026, 11, 19))
@@ -225,9 +238,27 @@ class PredictTests(unittest.TestCase):
     def test_trading_days_skip_bd_weekend(self):
         from bdstock import predict
 
-        days = predict.next_trading_days(date(2026, 11, 19), 3)  # Thursday
+        days = predict.next_trading_days(date(2026, 11, 19), 3, holidays=set())  # Thursday
         self.assertEqual(days, [date(2026, 11, 22), date(2026, 11, 23), date(2026, 11, 24)])  # Sun, Mon, Tue
-        self.assertTrue(all(d.weekday() not in (4, 5) for d in predict.next_trading_days(date(2026, 1, 1), 50)))
+        self.assertTrue(all(d.weekday() not in (4, 5) for d in predict.next_trading_days(date(2026, 1, 1), 50, set())))
+
+    def test_holidays_published_and_projected(self):
+        from bdstock import predict
+
+        data = {"2026": [{"date": "2026-12-16", "name": "Victory Day", "moon": False},
+                         {"date": "2026-03-20", "name": "Eid-ul-Fitr", "moon": True}]}
+        h = predict.holiday_dates(range(2026, 2028), data)
+        self.assertIn(date(2026, 12, 16), h)
+        self.assertIn(date(2027, 12, 16), h)          # fixed-date holiday repeats
+        self.assertIn(date(2027, 3, 9), h)            # moon holiday ~11 days earlier next year
+        days = predict.next_trading_days(date(2026, 12, 15), 2, holidays=h)  # Tue 15 Dec
+        self.assertEqual(days, [date(2026, 12, 17), date(2026, 12, 20)])    # skips Victory Day + weekend
+
+    def test_holiday_page_parsing(self):
+        self.assertEqual(dse.expand_holiday("11-12 February", 2026), [date(2026, 2, 11), date(2026, 2, 12)])
+        self.assertEqual(len(dse.expand_holiday("17 March - 23 March", 2026)), 7)
+        self.assertEqual(dse.expand_holiday("4 September", 2026), [date(2026, 9, 4)])
+        self.assertEqual(dse.expand_holiday("TBA", 2026), [])
 
     def test_band_quantiles_normal(self):
         import numpy as np
@@ -372,6 +403,135 @@ class RangeModelTests(unittest.TestCase):
         f = predict.ownership_features([date(2026, 10, 15), date(2026, 11, 5)], info)
         self.assertEqual(list(f["sponsor"]), [60.0, 55.0])  # Sep 30 pattern counts only after ~30 days
         self.assertEqual(list(f["institution"]), [10.0, 15.0])
+
+
+class LongHorizonTests(unittest.TestCase):
+    def test_long_ranges_grow_with_sqrt_time(self):
+        import math as _m
+        import numpy as np
+        from bdstock import predict
+
+        class FakeRanger:
+            def at(self, st, t):
+                return 0.10, {"q5": -1.6, "q16": -1.0, "q25": -0.67, "q35": -0.39, "q50": 0.0,
+                              "q65": 0.39, "q75": 0.67, "q84": 1.0, "q95": 1.6}
+
+        st = {"c": np.full(300, 100.0), "f": {"_atr": np.full(300, 2.0), "_liq_mn": np.full(300, 10.0)}}
+        rows = predict._long_rows("X", FakeRanger(), st, 299, 60, date(2026, 11, 23))
+        self.assertEqual([r[2] for r in rows], list(predict.LONG_HORIZONS))
+        # row layout: ..., median(7), low30(8), high30(9), low50(10), high50(11), low68(12), high68(13), ...
+        w6 = _m.log(rows[0][13] / rows[0][12])   # 68% range width at 6 months (log)
+        w12 = _m.log(rows[1][13] / rows[1][12])  # at 1 year
+        self.assertAlmostEqual(w6, 2 * 0.10 * _m.sqrt(120 / 60), places=2)
+        self.assertAlmostEqual(w12 / w6, _m.sqrt(245 / 120), places=2)
+        self.assertIsNone(rows[0][4])  # no direction probability for estimates
+
+
+class BangladeshFactorTests(unittest.TestCase):
+    def test_classify_bd_news(self):
+        from bdstock import bdfactors as bf
+
+        self.assertEqual(bf.classify_news("Query Response", "In response to the DSE query dated November 02, 2026 ... unusual price hike"), ["dse_query"])
+        self.assertIn("rumour", bf.classify_news("Clarification on News Published in Online News", "news published in the online news"))
+        self.assertEqual(bf.classify_news("Buy Declaration of a Sponsor Director", "intention to buy 1,024,138 shares"), ["sponsor_buy"])
+        self.assertEqual(bf.classify_news("Sale declaration of a Sponsor", "intention to sell 1,000,000 units"), ["sponsor_sell"])
+        self.assertIn("to_z", bf.classify_news("Category Change", "The Company will be placed in 'Z' category from existing 'A' category"))
+        up = bf.classify_news("Category Change", "The Company has been placed in 'A' category from existing 'Z' category")
+        self.assertIn("from_z", up)
+        self.assertNotIn("to_z", up)
+        self.assertIn("margin_ban", bf.classify_news("Prohibition", "requested to abstain from providing loan facilities to purchase securities"))
+        self.assertEqual(bf.classify_news("Board Meeting schedule", "meeting of the Board of Directors will be held"), [])
+
+    def test_spec_score(self):
+        from bdstock import bdfactors as bf
+
+        hi, why = bf.spec_score(0.1, 20, "Z", 0.40, 3, 4.0, True)
+        self.assertEqual(hi, 100)
+        self.assertTrue(any("free float" in w for w in why))
+        lo, _ = bf.spec_score(0.9, 60, "A", 0.02, 0, 1.0, False)
+        self.assertEqual(lo, 0)
+
+    def test_event_features_point_in_time(self):
+        from bdstock import bdfactors as bf
+
+        ev = [(date(2026, 3, 1), "dse_query"), (date(2026, 3, 5), "sponsor_sell"), (date(2026, 3, 6), "to_z")]
+        f = bf.event_features([date(2026, 2, 28), date(2026, 3, 1), date(2026, 3, 11), date(2026, 6, 30)], ev)
+        self.assertEqual(f["bd_query"][0], 0.0)                       # nothing known before the event
+        self.assertAlmostEqual(f["bd_query"][1], 1.0)
+        self.assertAlmostEqual(f["bd_query"][2], math.exp(-1), places=6)  # decays over ~10 days
+        self.assertEqual(f["bd_sponsor"][2], -1.0)
+        self.assertEqual(f["bd_toz"][2], 1.0)
+        self.assertEqual(f["bd_toz"][3], 0.0)                         # older than 60 days
+
+
+class PaperTradeTests(unittest.TestCase):
+    def _bars(self, rows):
+        return [{"trade_date": date(2026, 12, d), "open": o, "high": h, "low": lo, "close": c} for d, o, h, lo, c in rows]
+
+    def test_target_hit(self):
+        from bdstock import tradeplan as tp
+
+        s = {"status": "pending", "entry_price": None, "entry_date": None, "entry_limit": 100.0, "stop": 95.0,
+             "t2": 110.0, "exit_by": date(2026, 12, 20)}
+        r = tp._follow(s, self._bars([(1, 101, 102, 99.5, 101), (2, 101, 105, 100, 104), (3, 104, 111, 103, 110)]), 0.4)
+        self.assertEqual(r["status"], "target")
+        self.assertEqual(r["entry_price"], 100.0)
+        self.assertAlmostEqual(r["return_pct"], 10.0 - 0.8)
+
+    def test_missed_and_stopped_and_expired(self):
+        from bdstock import tradeplan as tp
+
+        base = {"status": "pending", "entry_price": None, "entry_date": None, "entry_limit": 100.0, "stop": 95.0,
+                "t2": 110.0, "exit_by": date(2026, 12, 3)}
+        self.assertEqual(tp._follow(base, self._bars([(1, 102, 103, 101, 102)]), 0.4)["status"], "missed")
+        st = tp._follow(base, self._bars([(1, 99, 100, 98, 99), (2, 97, 98, 94, 95)]), 0.4)
+        self.assertEqual((st["status"], st["exit_price"]), ("stopped", 95.0))
+        ex = tp._follow(base, self._bars([(1, 99, 100, 98, 99), (2, 100, 101, 99, 100), (3, 101, 102, 100, 101.5)]), 0.4)
+        self.assertEqual((ex["status"], ex["exit_price"]), ("expired", 101.5))
+        op = tp._follow(base, self._bars([(1, 99, 100, 98, 99)]), 0.4)
+        self.assertEqual(op["status"], "open")
+
+
+class TradePlanTests(unittest.TestCase):
+    def test_tick_rounding(self):
+        from bdstock import tradeplan as tp
+
+        self.assertEqual(tp.floor_tick(66.87), 66.8)
+        self.assertEqual(tp.ceil_tick(66.81), 66.9)
+        self.assertEqual(tp.ceil_tick(66.8), 66.8)
+
+    def test_lookup_interpolates(self):
+        from bdstock import tradeplan as tp
+
+        L = tp.LEVELS
+        K = len(L)
+        # win rate falls as the target gets further away and rises as the stop gets further away
+        p = [[max(0.0, min(1.0, 0.5 + 0.08 * (L[j] - L[i]))) for j in range(K)] for i in range(K)]
+        tables = {"levels": L, "windows": {"20": {"p_target": p, "p_stop": p, "ev_sigma": p}}}
+        a = tp.lookup(tables, 20, 2.0, 2.0)["win_rate"]
+        b = tp.lookup(tables, 20, 3.0, 2.0)["win_rate"]
+        mid = tp.lookup(tables, 20, 1.75, 2.0)["win_rate"]
+        self.assertAlmostEqual(a, 0.5)
+        self.assertLess(b, a)
+        self.assertTrue(b < mid < tp.lookup(tables, 20, 1.5, 2.0)["win_rate"] + 1e-9)
+        self.assertIsNone(tp.lookup(tables, 20, -1, 2))
+
+    def test_intraday_range_narrows(self):
+        from datetime import datetime as dt
+        from unittest import mock
+        from bdstock import tradeplan as tp
+
+        q = {"q5": -1.6, "q25": -0.6, "q75": 0.6, "q95": 1.7}
+        state = {"is_open": True, "session": {"today": {"opening": "10:00", "closing": "14:00"}}}
+        quote = {"ltp": 100.0}
+        widths = []
+        for hour in (10, 13):
+            with mock.patch.object(tp, "datetime") as m:
+                m.now.return_value = dt(2026, 11, 23, hour, 30)
+                r = tp.intraday_range("X", quote, state, 0.02, q)
+            widths.append(r["high50"] - r["low50"])
+        self.assertLess(widths[1], widths[0])  # later in the session -> narrower
+        self.assertIsNone(tp.intraday_range("X", quote, {"is_open": False}, 0.02, q))
 
 
 class EodTimingTests(unittest.TestCase):
