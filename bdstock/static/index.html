@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BD Stock Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232a78d6'/%3E%3Cpath d='M6 22l6-7 5 4 9-10' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+  <script>
+    try { const t = localStorage.getItem('bds-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+  <script src="/static/vendor/lightweight-charts.js"></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <a class="brand" href="#/">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7"/><path d="M6 22l6-7 5 4 9-10"/></svg>
+        <span><strong>BD Stock</strong> Tracker</span>
+      </a>
+      <nav class="nav" id="nav">
+        <a href="#/" data-route="">Dashboard</a>
+        <a href="#/market" data-route="market">Market</a>
+        <a href="#/screener" data-route="screener">Screener</a>
+        <a href="#/predict" data-route="predict">Prediction</a>
+        <a href="#/accuracy" data-route="accuracy">Accuracy</a>
+        <a href="#/watchlist" data-route="watchlist">Watchlist</a>
+        <a href="#/portfolio" data-route="portfolio">Portfolio</a>
+        <a href="#/alerts" data-route="alerts">Alerts</a>
+        <a href="#/reports" data-route="reports">Daily reports</a>
+        <a href="#/settings" data-route="settings">Settings</a>
+      </nav>
+      <div class="sidebar-foot" id="monitor-info"></div>
+    </aside>
+    <div class="main">
+      <header class="topbar">
+        <form class="search" id="search-form" autocomplete="off">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+          <input id="search" list="codes" placeholder="Search trading code or company (e.g. GP, BRACBANK)" aria-label="Search stocks">
+          <datalist id="codes"></datalist>
+        </form>
+        <div class="topbar-right">
+          <span class="status-pill" id="status-pill"><span class="dot"></span><span class="txt">Connecting…</span></span>
+          <button class="icon-btn" id="refresh-btn" title="Fetch latest prices from DSE" aria-label="Refresh prices">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg>
+          </button>
+          <button class="icon-btn" id="theme-btn" title="Toggle light/dark theme" aria-label="Toggle theme">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+          </button>
+        </div>
+      </header>
+      <div id="banner"></div>
+      <main id="view" class="view"></main>
+      <footer class="footer">
+        Data from the public Dhaka Stock Exchange website (dse.com.bd). Signals are rule-based chart summaries for personal research, not investment advice.
+        Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>.
+      </footer>
+    </div>
+  </div>
+  <div id="toasts" aria-live="polite"></div>
+  <dialog id="modal"></dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>
