@@ -19,6 +19,7 @@ DEFAULTS: dict[str, str] = {
     "risk_pct": "1.0",           # max % of capital lost if a stop-loss is hit
     "max_position_pct": "20",    # max % of capital in one share
     "ai_daily_minutes": "10",    # time budget for AI news scoring in the end-of-day run
+    "ai_profile_minutes": "10",  # time budget for AI company health checks in the end-of-day run
 }
 
 

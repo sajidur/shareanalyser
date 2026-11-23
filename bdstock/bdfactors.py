@@ -11,13 +11,17 @@
 3. Political / regulatory events - elections from DSE's holiday list plus events the user records;
    the market's reaction around each is measured.
 4. Speculation (pump-and-dump) risk score per share.
+5. Political & state influence: central bank / regulator taking control of a board (dissolution,
+   administrator, observer), court orders, companies reporting political disruption, government
+   shareholding, each share's sensitivity to market sell-off days, and political exposure the
+   USER records (with a source). The tool never guesses anyone's political affiliation.
 
 Political influence cannot be measured directly; only its footprint in prices and disclosures.
-No company is labelled as politically connected.
 """
 from __future__ import annotations
 
 import bisect
+import json
 import logging
 import math
 import re
@@ -40,9 +44,37 @@ EVENT_TYPES: dict[str, tuple[str, str, int]] = {
     "to_z": ("Downgraded to category Z", r"placed in ['‘’\"]?z['‘’\"]? category", 30),
     "from_z": ("Upgraded from category Z", r"from existing ['‘’\"]?z['‘’\"]? category", 30),
     "margin_ban": ("Margin loans prohibited", r"abstain from providing loan facilities|loan facilities to purchase", 30),
-    "regulator": ("Regulator action (inspection / penalty / board change)", r"inspection|penalt|\bfined\b|investigat|reconstitut|administrator", 10),
+    "regulator": ("Regulator action (inspection / penalty)", r"inspection|penalt|\bfined\b|investigat", 10),
     "govt": ("Government / state / central bank in company news", r"\bgovernment\b|\bministry\b|state-owned|\bstate may\b|bangladesh bank|nationali[sz]", 10),
+    "state_control": ("Central bank / regulator took control (board dissolved, administrator, observer)",
+                      r"dissolv\w*\s+(?:the\s+)?(?:previous\s+|existing\s+)?board|board of directors[^.]{0,60}dissolv"
+                      r"|dissolution of the board|\badministrators?\b|as an observer|observer on the board|bank resolution"
+                      r"|reconstitut\w*[^.]{0,40}board[^.]{0,100}(?:bangladesh bank|commission|bsec)"
+                      r"|(?:bangladesh bank|bsec|the commission)[^.]{0,100}reconstitut", 60),
+    "political_hit": ("Results mention political unrest / disruption",
+                      r"politic\w*\s+(?:unrest|upheaval|situation|instability|turmoil|crisis|change|transition|violence|disturbance)"
+                      r"|(?:unrest|upheaval|instability|turmoil)[^.]{0,30}politic|due to[^.]{0,40}political"
+                      r"|july[- ]august (?:2024 )?(?:movement|uprising|revolution)|mass uprising", 60),
+    "court_hold": ("Court order / legal dispute (AGM, dividend or control)",
+                   r"high court|court order|court division|writ petition|appellate division|order of the hon", 30),
+    "wipeout": ("Declared non-viable / shareholders' capital written off",
+                r"reduced to zero|reduction of (?:the )?entire paid-up capital|non-viable|okarjokar", 3650),
 }
+# political events stay relevant longer than a rumour: days an event counts as "active"
+ACTIVE_DAYS = {"state_control": 180, "political_hit": 120, "court_hold": 90, "wipeout": 3650}
+POLITICAL_KINDS = tuple(ACTIVE_DAYS)
+SHOCK_DAY = -0.01   # equal-weight market down 1% or more in a session: a sell-off day
+
+# political exposure the user records (from news they trust); never guessed by the tool
+EXPOSURES = {
+    "former_govt": "Owner / sponsor linked to the former government",
+    "ruling": "Owner / sponsor linked to the current government",
+    "opposition": "Owner / sponsor linked to an opposition party",
+    "state_appointed": "Board appointed or controlled by the state / regulator",
+    "under_action": "Owners face investigation, asset freeze, arrest or travel ban",
+    "other": "Other political exposure",
+}
+RISKY_EXPOSURES = ("former_govt", "under_action")
 PRICE_EVENTS = {
     "upper_circuit": "Upper circuit day (+9.5% or more)",
     "lower_circuit": "Lower circuit day (−9.5% or less)",
@@ -56,8 +88,13 @@ def _r(x: float | None, nd: int = 2) -> float | None:
     return None if x is None or not math.isfinite(x) else round(x, nd)
 
 
+def active_days(kind: str, default: int = 28) -> int:
+    return ACTIVE_DAYS.get(kind, default)
+
+
 def classify_news(summary: str, body: str) -> list[str]:
-    text = f"{summary} {body[:800]}".lower()
+    # long bodies: results announcements explain deviations (e.g. political unrest) near the end
+    text = f"{summary} {body[:3000]}".lower()
     found = [k for k, (_, rx, _) in EVENT_TYPES.items() if re.search(rx, text)]
     if "sponsor_buy" in found and "sponsor_sell" in found:  # 'buy declaration ... sell' edge cases
         found.remove("sponsor_sell" if "buy declaration" in text else "sponsor_buy")
@@ -69,7 +106,7 @@ def classify_news(summary: str, body: str) -> list[str]:
 def load_news_events() -> dict[str, list[tuple[date, str]]]:
     """code -> [(date, event_type)] sorted, de-duplicated per type within its window."""
     raw: dict[str, list[tuple[date, str]]] = defaultdict(list)
-    for r in db.query("SELECT code, news_date, summary, LEFT(body, 800) AS body FROM news ORDER BY code, news_date"):
+    for r in db.query("SELECT code, news_date, summary, LEFT(body, 3000) AS body FROM news ORDER BY code, news_date"):
         for t in classify_news(r["summary"] or "", r["body"] or ""):
             raw[r["code"]].append((r["news_date"], t))
     out: dict[str, list[tuple[date, str]]] = {}
@@ -231,6 +268,147 @@ def spec_score(size_pct: float | None, free_float: float | None, category: str |
     return min(100, pts), why
 
 
+# ============================================================================ political & state influence
+
+def govt_holdings() -> dict[str, float]:
+    """Latest published government shareholding % per company (DSE share pattern), where > 0."""
+    from .predict import _PATTERN_DATE, dse_date
+
+    out = {}
+    for r in db.query("SELECT code, extra_json FROM company_info"):
+        try:
+            pats = json.loads(r["extra_json"] or "{}").get("sharePattern") or []
+        except ValueError:
+            continue
+        best = None
+        for p in pats:
+            if not isinstance(p, dict) or not isinstance(p.get("pattern"), dict):
+                continue
+            m = _PATTERN_DATE.search(str(p.get("date") or ""))
+            d = (dse_date(m.group(1)) if m else None) or date.min
+            if best is None or d >= best[0]:
+                best = (d, p["pattern"])
+        g = float((best[1].get("government") or 0) if best else 0)
+        if g > 0:
+            out[r["code"]] = round(g, 2)
+    return out
+
+
+def shock_betas(panel: dict, market: dict, min_days: int = 5) -> dict[str, dict]:
+    """How hard each share fell on market sell-off days (equal-weight market <= -1%), relative to
+    the market: 1.0 = like the market, 2.0 = twice as much. Shrunk towards 1 when there are few days."""
+    shock = market["ret"] <= SHOCK_DAY
+    out = {}
+    for code, s in panel.items():
+        if s["type"] != "EQ" or len(s["c"]) < 120:
+            continue
+        lr = np.r_[np.nan, np.diff(np.log(s["c"]))]
+        di = s["di"]
+        m = shock[di] & np.isfinite(lr) & (s["v"] > 0)
+        n = int(m.sum())
+        msum = float(market["ret"][di[m]].sum()) if n else 0.0
+        if n < min_days or msum >= 0:
+            continue
+        raw = float(lr[m].sum()) / msum
+        w = n / (n + 10)
+        out[code] = {"beta": _r(w * raw + (1 - w), 2), "days": n, "avg": _r(float(lr[m].mean()) * 100, 2)}
+    return out
+
+
+def _group_stats(codes: list[str], panel: dict, market: dict, uneasy: set[int]) -> dict:
+    """20-session excess return vs the market for a group of shares, sampled every 5 sessions,
+    overall and on days when the market regime was Nervous or Stress."""
+    all_ex, bad_ex, n = [], [], 0
+    for code in codes:
+        s = panel.get(code)
+        if not s or s["type"] != "EQ" or len(s["c"]) < 40:
+            continue
+        n += 1
+        for t in range(20, len(s["c"]) - 20, 5):
+            _, ex = _fwd(s, t, 20, market)
+            if ex is None:
+                continue
+            all_ex.append(ex)
+            if int(s["di"][t]) in uneasy:
+                bad_ex.append(ex)
+
+    def summ(v: list[float]) -> dict:
+        if len(v) < 5:
+            return {"samples": len(v)}
+        a = np.array(v)
+        return {"samples": len(v), "ex20": _r(float(np.median(a)) * 100, 2), "pos20": _r(float((a > 0).mean()) * 100, 0),
+                "p10": _r(float(np.percentile(a, 10)) * 100, 1)}
+
+    return {"companies": n, "all": summ(all_ex), "uneasy": summ(bad_ex)}
+
+
+def political_links(code: str | None = None) -> list[dict]:
+    sql = "SELECT * FROM political_links"
+    rows = db.query(sql + (" WHERE code=%s" if code else "") + " ORDER BY code, id", (code,) if code else ())
+    for r in rows:
+        r["exposure_label"] = EXPOSURES.get(r["exposure"], r["exposure"])
+    return rows
+
+
+def add_link(data: dict) -> int:
+    code = str(data.get("code") or "").strip().upper()
+    exposure = str(data.get("exposure") or "")
+    if exposure not in EXPOSURES:
+        raise ValueError("Choose the kind of exposure")
+    source = str(data.get("source") or "").strip()
+    if not source:
+        raise ValueError("Add a source (newspaper, link or filing) so the record can be checked later")
+    since = data.get("since") or None
+    if since:
+        try:
+            since = date.fromisoformat(str(since))
+        except ValueError:
+            raise ValueError("Invalid date")
+    if not code or not db.scalar("SELECT COUNT(*) FROM instruments WHERE code=%s", (code,)):
+        raise ValueError("Unknown trading code")
+    return db.execute(
+        "INSERT INTO political_links (code, person, role, exposure, since, source, note, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())",
+        (code, (str(data.get("person") or "").strip() or None), (str(data.get("role") or "").strip()[:60] or None),
+         exposure, since, source[:300], (str(data.get("note") or "").strip()[:500] or None)),
+    )
+
+
+def delete_link(link_id: int) -> None:
+    db.execute("DELETE FROM political_links WHERE id=%s", (link_id,))
+
+
+def _political(panel: dict, market: dict, regimes: list[dict], cal: list[date],
+               news_events: dict[str, list[tuple[date, str]]]) -> dict:
+    ci = {d: i for i, d in enumerate(cal)}
+    uneasy = {ci[r["date"]] for r in regimes if r["regime"] in ("Nervous", "Stress")}
+    govt = govt_holdings()
+    shock = shock_betas(panel, market)
+    groups: dict[str, dict] = {
+        "all": {"label": "All shares (for comparison)", "hindsight": False,
+                **_group_stats([c for c, s in panel.items() if s["type"] == "EQ"], panel, market, uneasy)},
+        "state_owned": {"label": "Government holds shares (state-owned / state-backed)", "hindsight": False,
+                        "codes": sorted(govt), **_group_stats(sorted(govt), panel, market, uneasy)},
+    }
+    betas = sorted((v["beta"] for v in shock.values()), reverse=True)
+    if len(betas) >= 20:
+        cut = betas[len(betas) // 5]
+        hi = [c for c, v in shock.items() if v["beta"] >= cut]
+        groups["shock_high"] = {"label": f"Fell hardest on sell-off days (top 20%, ≥ {cut:.2f}× market)", "hindsight": True,
+                                "codes": sorted(hi), **_group_stats(hi, panel, market, uneasy)}
+    by_exp: dict[str, set] = defaultdict(set)
+    for r in political_links():
+        by_exp[r["exposure"]].add(r["code"])
+    for k, codes in by_exp.items():
+        groups["link_" + k] = {"label": "Your records: " + EXPOSURES[k], "hindsight": True,
+                               "codes": sorted(codes), **_group_stats(sorted(codes), panel, market, uneasy)}
+    last = cal[-1] if cal else date.today()
+    events = {c: [(d.isoformat(), t) for d, t in evs if t in POLITICAL_KINDS and (last - d).days <= max(365, active_days(t))]
+              for c, evs in news_events.items()}
+    return {"shock_day_pct": SHOCK_DAY * 100, "shock_days": int((market["ret"] <= SHOCK_DAY).sum()),
+            "shock": shock, "govt_hold": govt, "groups": groups, "events": {c: v for c, v in events.items() if v}}
+
+
 def _company_static() -> tuple[dict, dict]:
     rows = db.query("SELECT c.code, c.free_float, c.paid_up_capital, c.face_value FROM company_info c")
     ff = {r["code"]: r["free_float"] for r in rows}
@@ -342,8 +520,10 @@ def build() -> dict:
         "events": events,
         "spec_stats": spec_stats,
         "spec_today": today_scores,
-        "recent_events": {c: [(d.isoformat(), t) for d, t in evs if d >= cal[-1] - timedelta(days=45)]
+        # political events stay active longer; consumers filter again with active_days()
+        "recent_events": {c: [(d.isoformat(), t) for d, t in evs if (cal[-1] - d).days <= max(45, active_days(t, 45))]
                           for c, evs in news_events.items() if evs and cal},
+        "political": _political(panel, market, regimes, cal, news_events),
     }
     db.set_state("bd_factors", out)
     log.info("Bangladesh factors built in %ss", round((datetime.now() - started).total_seconds(), 1))
@@ -401,28 +581,49 @@ def delete_event(event_id: int) -> None:
 def stock_view(code: str, state: dict | None = None) -> dict:
     st = state or db.get_state("bd_factors") or {}
     studies = st.get("studies", {})
-    recent = [{"date": d, "type": t, "label": studies.get(t, {}).get("label", t),
-               "ex20": studies.get(t, {}).get("ex20"), "ex5": studies.get(t, {}).get("ex5"),
-               "n": studies.get(t, {}).get("n"), "evidence": studies.get(t, {}).get("evidence")}
-              for d, t in (st.get("recent_events", {}).get(code) or [])]
+    last = date.fromisoformat(st["history_to"]) if st.get("history_to") else date.today()
+
+    def ev(d: str, t: str) -> dict:
+        s = studies.get(t, {})
+        return {"date": d, "type": t, "label": s.get("label", t), "ex20": s.get("ex20"), "ex5": s.get("ex5"),
+                "n": s.get("n"), "evidence": s.get("evidence"), "direction": s.get("direction")}
+
+    recent = [ev(d, t) for d, t in (st.get("recent_events", {}).get(code) or [])
+              if (last - date.fromisoformat(d)).days <= active_days(t, 45)]
+    pol = st.get("political") or {}
+    shock = (pol.get("shock") or {}).get(code)
+    if shock:
+        betas = sorted(v["beta"] for v in pol["shock"].values())
+        shock = {**shock, "pct_rank": _r(bisect.bisect_left(betas, shock["beta"]) / max(1, len(betas) - 1) * 100, 0)}
+    links = political_links(code)
+    groups = pol.get("groups") or {}
+    mine = [{"key": k, **{x: g.get(x) for x in ("label", "companies", "all", "uneasy", "hindsight")}}
+            for k, g in groups.items()
+            if code in (g.get("codes") or []) and (k.startswith("link_") or k == "state_owned")]
     return {"recent_events": recent[::-1], "speculation": (st.get("spec_today") or {}).get(code),
-            "spec_stats": st.get("spec_stats"), "regime": st.get("regime_now"), "regime_stats": st.get("regime_stats")}
+            "spec_stats": st.get("spec_stats"), "regime": st.get("regime_now"), "regime_stats": st.get("regime_stats"),
+            "political": {"govt_hold": (pol.get("govt_hold") or {}).get(code), "shock": shock,
+                          "shock_day_pct": pol.get("shock_day_pct"), "links": links, "groups": mine,
+                          "baseline": groups.get("all"),
+                          "events": [ev(d, t) for d, t in (pol.get("events") or {}).get(code, [])][::-1]}}
 
 
 def event_features(dates: list[date], events: list[tuple[date, str]]) -> dict[str, list[float]]:
     """Point-in-time Bangladesh inputs per date (only events dated on/before it)."""
     n = len(dates)
-    out = {k: [0.0] * n for k in ("bd_query", "bd_rumour", "bd_sponsor", "bd_toz", "bd_margin", "bd_govt")}
+    out = {k: [0.0] * n for k in ("bd_query", "bd_rumour", "bd_sponsor", "bd_toz", "bd_margin", "bd_govt",
+                                  "bd_state", "bd_polhit", "bd_court")}
     if not events:
         return out
     ev_d = [e[0] for e in events]
+    window = max(ACTIVE_DAYS.values())
     for i, t in enumerate(dates):
         hi = bisect.bisect_right(ev_d, t)
         if hi == 0:
             continue
-        lo90 = bisect.bisect_right(ev_d, t - timedelta(days=90))
+        lo = bisect.bisect_right(ev_d, t - timedelta(days=window))
         net, govt = 0, 0
-        for d, kind in events[lo90:hi]:
+        for d, kind in events[lo:hi]:
             age = (t - d).days
             if kind == "dse_query":
                 out["bd_query"][i] = max(out["bd_query"][i], math.exp(-age / 10))
@@ -432,10 +633,16 @@ def event_features(dates: list[date], events: list[tuple[date, str]]) -> dict[st
                 net += 1 if kind == "sponsor_buy" else -1
             elif kind == "to_z" and age <= 60:
                 out["bd_toz"][i] = 1.0
-            elif kind == "margin_ban":
+            elif kind == "margin_ban" and age <= 90:
                 out["bd_margin"][i] = 1.0
             elif kind in ("govt", "regulator") and age <= 30:
                 govt += 1
+            elif kind in ("state_control", "wipeout") and age <= ACTIVE_DAYS[kind]:
+                out["bd_state"][i] = 1.0
+            elif kind == "political_hit" and age <= ACTIVE_DAYS[kind]:
+                out["bd_polhit"][i] = 1.0
+            elif kind == "court_hold" and age <= ACTIVE_DAYS[kind]:
+                out["bd_court"][i] = 1.0
         out["bd_sponsor"][i] = float(max(-3, min(3, net)))
         out["bd_govt"][i] = float(min(3, govt))
     return out

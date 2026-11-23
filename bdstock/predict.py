@@ -115,6 +115,18 @@ FEATURES: list[tuple[str, str, str, str]] = [
     ("bd_toz", "Downgraded to category Z (60d)", "flag", "bangladesh"),
     ("bd_margin", "Margin loans prohibited", "flag", "bangladesh"),
     ("bd_govt", "Government / regulator news (30d)", "count", "bangladesh"),
+    ("nocf_g", "Operating cash flow/share vs last year (latest results)", "growth", "quality"),
+    ("navps_g", "NAV per share change (latest results)", "growth", "quality"),
+    ("rel_ey", "Earnings yield vs sector median", "pct", "quality"),
+    ("rel_bp", "Book / price vs sector median", "times", "quality"),
+    ("mf_disc", "Mutual fund price vs NAV (premium / discount)", "pct", "quality"),
+    ("circ_streak", "Consecutive circuit-limit days", "signed", "activity"),
+    ("spec_turn", "Market turnover in category Z & small shares", "frac", "market"),
+    ("govt_hold", "Government (state) shareholding", "share", "political"),
+    ("bd_state", "Central bank / regulator control of the board (180d)", "flag", "political"),
+    ("bd_polhit", "Results mention political unrest (120d)", "flag", "political"),
+    ("bd_court", "Court order / legal dispute (90d)", "flag", "political"),
+    ("shock_beta", "Fall on market sell-off days vs market (political / macro shocks)", "num", "political"),
 ]
 FEATURE_KEYS = [f[0] for f in FEATURES]
 GROUPS: dict[str, list[int]] = defaultdict(list)
@@ -124,7 +136,9 @@ GROUP_LABELS = {"technical": "Price & volume (technical)", "liquidity": "Liquidi
                 "market": "Market conditions", "sector": "Sector strength", "fundamentals": "Fundamentals",
                 "news": "News & announcements", "activity": "Trading activity", "risk": "Risk (beta, 52-week)",
                 "ownership": "Ownership & size", "calendar": "Day of week",
-                "bangladesh": "Bangladesh factors (rumour, insiders, regulator, government)"}
+                "bangladesh": "Bangladesh factors (rumour, insiders, regulator, government)",
+                "quality": "Earnings quality & relative value",
+                "political": "Political & state influence (state ownership, takeovers, courts, shock sensitivity)"}
 WARMUP = 60
 MIN_TRAIN_ROWS = 2000
 LIQUID_MN = 5.0          # Tk million average daily traded value: "liquid enough to trade"
@@ -135,6 +149,13 @@ VOL_INPUTS = ["log 5-day volatility", "log 20-day volatility", "log 60-day volat
               "log intraday high-low range", "idle days", "liquidity", "log price (tick size)",
               "circuit-limit days", "announcements (7d)", "record date soon", "|last move|", "|1-week move|",
               "stock-specific volatility", "market cap", "log market volatility", "category Z"]
+# Bangladesh / political inputs the range model may add; used only if they win on unseen data
+VOL_BD_INPUTS = ["market in Stress", "market Euphoric", "DSE query (recent)", "rumour clarification (recent)",
+                 "downgraded to Z", "margin-loan ban", "central bank / regulator control", "court order",
+                 "sell-off sensitivity", "government holding", "pump-and-dump pattern (circuit streak)"]
+V_BASE = list(range(len(VOL_INPUTS)))
+V_ALL = list(range(len(VOL_INPUTS) + len(VOL_BD_INPUTS)))
+RANGE_METHODS = ("baseline", "vol", "vol_binned", "vol_bd", "vol_bd_binned")
 FOLDS, FOLD_DAYS = 3, 15  # rolling out-of-sample test windows
 
 
@@ -340,9 +361,9 @@ OWNERSHIP_LAG_DAYS = 30  # monthly shareholding is published a few weeks after m
 
 
 def ownership_features(dates: list[date], info: dict) -> dict[str, np.ndarray]:
-    """Sponsor / institutional / foreign holding %, each from its publication (point-in-time)."""
+    """Sponsor / institutional / foreign / government holding %, each from its publication (point-in-time)."""
     n = len(dates)
-    out = {k: np.zeros(n) for k in ("sponsor", "institution", "foreign")}
+    out = {k: np.zeros(n) for k in ("sponsor", "institution", "foreign", "govt_hold")}
     try:
         extra = json.loads(info.get("extra_json") or "{}") if info else {}
     except ValueError:
@@ -366,7 +387,21 @@ def ownership_features(dates: list[date], info: dict) -> dict[str, np.ndarray]:
             out["sponsor"][i] = float(pat.get("sponsor") or 0)
             out["institution"][i] = float(pat.get("institution") or 0)
             out["foreign"][i] = float(pat.get("foreign") or 0)
+            out["govt_hold"][i] = float(pat.get("government") or 0)
     return out
+
+
+def shock_beta_series(r1: np.ndarray, mret: np.ndarray, traded: np.ndarray, threshold: float = -0.01) -> np.ndarray:
+    """Point-in-time: how hard the share fell on all earlier market sell-off days (market <= -1%),
+    relative to the market. 1 = like the market. Shrunk towards 1 while there are few such days."""
+    shock = (mret <= threshold) & np.isfinite(r1) & traded
+    s_sum = np.cumsum(np.where(shock, np.nan_to_num(r1), 0.0))
+    m_sum = np.cumsum(np.where(shock, mret, 0.0))
+    cnt = np.cumsum(shock)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        raw = np.where(m_sum < 0, s_sum / m_sum, 1.0)
+    w = cnt / (cnt + 10.0)
+    return np.clip(w * raw + (1 - w), -1.0, 4.0)
 
 
 def dse_date(s: str) -> date | None:
@@ -460,9 +495,18 @@ def activity_features(c: np.ndarray, o: np.ndarray, h: np.ndarray, lo: np.ndarra
             streak[t] = streak[t - 1] - 1 if streak[t - 1] < 0 else -1
     hi52 = np.array([h[max(0, t - 249): t + 1].max() for t in range(n)])
     lo52 = np.array([lo[max(0, t - 249): t + 1].min() for t in range(n)])
+    # consecutive circuit-limit days (+ up, - down): DSE "circuit chasing" behaviour
+    circ = np.zeros(n)
+    lim = math.log(1.09)
+    for t in range(1, n):
+        x = r1[t]
+        if np.isfinite(x) and x >= lim:
+            circ[t] = circ[t - 1] + 1 if circ[t - 1] > 0 else 1
+        elif np.isfinite(x) and x <= -lim:
+            circ[t] = circ[t - 1] - 1 if circ[t - 1] < 0 else -1
     return {
         "clv5": _roll_mean(clv, 5), "gap": gap, "hl5": _roll_mean(hl, 5),
-        "tsize": tsize, "tratio": tratio, "streak": np.clip(streak, -7, 7),
+        "tsize": tsize, "tratio": tratio, "streak": np.clip(streak, -7, 7), "circ_streak": np.clip(circ, -5, 5),
         "circ20": _roll_mean((np.nan_to_num(np.abs(r1)) >= 0.09).astype(float), 20) * 20,
         "d_hi52": c / hi52 - 1, "d_lo52": c / lo52 - 1,
     }
@@ -573,10 +617,30 @@ def build_dataset() -> dict[str, Any]:
         if st["shares"]:
             sizes.append(math.log(st["c"][-1] * shares / 1e6))
     size_fill = float(np.median(sizes)) if sizes else 7.0
+    small_cut = float(np.percentile(sizes, 30)) if sizes else 0.0
+    # market speculation gauge: share of turnover going to category-Z and small companies
+    spec_val = np.zeros(nd)
+    for st in stocks.values():
+        small = st["shares"] and math.log(st["c"][-1] * st["shares"] / 1e6) <= small_cut
+        if st["category"] == "Z" or small:
+            np.add.at(spec_val, st["di"], st["c"] * st["v"] / 1e6)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        spec_turn = np.nan_to_num(_roll_mean(spec_val, 5) / np.maximum(_roll_mean(value, 5), 1e-9), nan=0.0)
+    # market regime per day (uses only data up to that day): the footprint of political / macro shocks
+    reg_stress, reg_euph = np.zeros(nd), np.zeros(nd)
+    reg_label = [""] * nd
+    for r in bdfactors.regime_series(calendar, {"ret": mret, "breadth": np.nan_to_num(breadth, nan=0.5), "value": value}):
+        k = cal_idx[r["date"]]
+        reg_label[k] = r["regime"]
+        reg_stress[k] = 1.0 if r["regime"] == "Stress" else 0.0
+        reg_euph[k] = 1.0 if r["regime"] == "Euphoric" else 0.0
     for code, st in stocks.items():
         f, di = st["f"], st["di"]
         n = len(di)
         info = infos.get(code) or {}
+        f["spec_turn"] = spec_turn[di]
+        f["shock_beta"] = shock_beta_series(f["r1"], mret[di], st["v"] > 0)
+        f["_reg_stress"], f["_reg_euph"] = reg_stress[di], reg_euph[di]
         # risk: rolling 60-day beta and stock-specific volatility against the equal-weight market
         x, yv = mret[di], np.nan_to_num(f["r1"])
         mx, my = _roll_mean(x, 60), _roll_mean(yv, 60)
@@ -602,20 +666,38 @@ def build_dataset() -> dict[str, Any]:
         f.update(fundamental_features(st["dates"], st["c"], fundamental_points(infos.get(code))))
         f.update({k: np.array(v) for k, v in news.features(st["dates"], events.get(code, [])).items()})
         f.update({k: np.array(v) for k, v in bdfactors.event_features(st["dates"], bd_events.get(code, [])).items()})
+        with np.errstate(invalid="ignore", divide="ignore"):
+            f["mf_disc"] = np.where(f["mf_nav"] > 0, np.clip(st["c"] / f["mf_nav"] - 1, -0.8, 1.0), 0.0)
+    # valuation relative to sector peers on the same day (point-in-time fundamentals)
+    peer: dict[tuple[int, str], list[tuple[float, float]]] = defaultdict(list)
+    for st in stocks.values():
+        f = st["f"]
+        for t in np.nonzero(f["f_missing"] == 0)[0]:
+            peer[(int(st["di"][t]), st["sector"])].append((f["ey"][t], f["bp"][t]))
+    med = {k: (float(np.median([a for a, _ in v])), float(np.median([b for _, b in v]))) for k, v in peer.items() if len(v) >= 3}
+    for code, st in stocks.items():
+        f, di = st["f"], st["di"]
+        m = [med.get((int(i), st["sector"])) for i in di]
+        has = (f["f_missing"] == 0)
+        f["rel_ey"] = np.array([(f["ey"][t] - m[t][0]) if m[t] and has[t] else 0.0 for t in range(len(di))])
+        f["rel_bp"] = np.array([(f["bp"][t] - m[t][1]) if m[t] and has[t] else 0.0 for t in range(len(di))])
         st["X"] = np.column_stack([f[k] for k in FEATURE_KEYS])
         e = 1e-4
         st["V"] = np.column_stack([
             np.log(f["_s5"] + e), np.log(f["vol20"] + e), np.log(f["_sigma"] + e), np.log(f["_atr"] / st["c"] + e),
             np.log(f["hl5"] + e), f["idle"], f["liq"], np.log(st["c"]), f["circ20"], f["news_cnt"], f["record_soon"],
             np.abs(f["r1"]), np.abs(f["r5"]), f["idio60"], f["size"], np.log(f["_mvol"] + e), f["cat_z"],
+            # Bangladesh / political inputs (VOL_BD_INPUTS)
+            f["_reg_stress"], f["_reg_euph"], f["bd_query"], f["bd_rumour"], f["bd_toz"], f["bd_margin"],
+            f["bd_state"], f["bd_court"], f["shock_beta"], f["govt_hold"] / 100, np.abs(f["circ_streak"]),
         ])
-    return {"stocks": stocks, "calendar": calendar,
+    return {"stocks": stocks, "calendar": calendar, "mret": mret, "regime": reg_label, "bd_events": bd_events,
             "news_coverage": sum(1 for c in stocks if events.get(c)), "fund_coverage": sum(1 for c in stocks if infos.get(c))}
 
 
 def training_rows(ds: dict, horizon: int) -> dict[str, np.ndarray]:
-    X, V, y, di, ti, liq, sig = [], [], [], [], [], [], []
-    for code in sorted(ds["stocks"]):
+    X, V, y, di, ti, liq, sig, ci, tt = [], [], [], [], [], [], [], [], []
+    for k, code in enumerate(sorted(ds["stocks"])):
         st = ds["stocks"][code]
         n = len(st["c"])
         if n <= WARMUP + horizon:
@@ -633,10 +715,13 @@ def training_rows(ds: dict, horizon: int) -> dict[str, np.ndarray]:
         ti.append(st["di"][t + horizon])
         liq.append(st["f"]["_liq_mn"][t])
         sig.append(st["f"]["_sigma"][t])
+        ci.append(np.full(len(t), k))   # which share (index into sorted codes) and which session:
+        tt.append(t)                    # needed to add the Bangladesh factors row by row
     if not X:
         return {}
     return {"X": np.vstack(X), "V": np.vstack(V), "y": np.concatenate(y), "di": np.concatenate(di),
-            "ti": np.concatenate(ti), "liq": np.concatenate(liq), "sigma": np.concatenate(sig)}
+            "ti": np.concatenate(ti), "liq": np.concatenate(liq), "sigma": np.concatenate(sig),
+            "ci": np.concatenate(ci), "tt": np.concatenate(tt)}
 
 
 class VolModel:
@@ -669,14 +754,17 @@ class VolModel:
 
 
 class Ranger:
-    """Produces (scale, quantiles) for a stock/day with the chosen range method."""
+    """Produces (scale, quantiles) for a stock/day with the chosen range method:
+    baseline, vol, vol_binned, and vol_bd / vol_bd_binned (adds the Bangladesh & political inputs)."""
 
     def __init__(self, method: str, rows: dict, horizon: int):
-        self.method, self.h = method, horizon
-        if method == "baseline":
+        self.method = method if method in RANGE_METHODS else "baseline"
+        self.h = horizon
+        self.cols = V_ALL if "_bd" in self.method else V_BASE
+        if self.method == "baseline":
             self.q = band_quantiles(rows["y"], rows["sigma"], horizon)
         else:
-            self.vm = VolModel().fit(rows["V"], rows["y"])
+            self.vm = VolModel().fit(rows["V"][:, self.cols], rows["y"])
 
     def at(self, st: dict, t: int) -> tuple[float, dict]:
         if self.method == "baseline":
@@ -685,18 +773,19 @@ class Ranger:
                 v20 = st["f"]["vol20"][t]
                 sigma = v20 if np.isfinite(v20) and v20 > 0 else 0.02
             return float(sigma) * math.sqrt(self.h), self.q
-        v = st["V"][t]
+        v = st["V"][t][self.cols]
         if not np.isfinite(v).all():  # an input is missing: fall back to the stock's own volatility
             sigma = st["f"]["_sigma"][t]
             sigma = sigma if np.isfinite(sigma) and sigma > 0 else 0.02
             return float(sigma) * math.sqrt(self.h), self.vm.q_all
         s = float(self.vm.sigma(v[None, :])[0])
-        return s, self.vm.quantiles(s, self.method == "vol_binned")
+        return s, self.vm.quantiles(s, self.method.endswith("binned"))
 
 
 def range_evaluate(rows: dict, horizon: int) -> dict:
-    """Test the three range methods on the same rolling unseen windows. The winner has the lowest
-    interval score for the 68% range: width + (2/0.32) x how far the price ended outside it."""
+    """Test the range methods on the same rolling unseen windows. The winner has the lowest
+    interval score for the 68% range: width + (2/0.32) x how far the price ended outside it.
+    The Bangladesh / political inputs are used only if the methods with them win."""
     dates = np.unique(rows["di"])
     stats: dict[str, list] = defaultdict(list)
     for f in range(FOLDS, 0, -1):
@@ -710,14 +799,13 @@ def range_evaluate(rows: dict, horizon: int) -> dict:
             continue
         y = rows["y"][te]
         base_q = band_quantiles(rows["y"][tr], rows["sigma"][tr], horizon)
-        vm = VolModel().fit(rows["V"][tr], rows["y"][tr])
-        s_vol = vm.sigma(rows["V"][te])
-        bins = np.searchsorted(vm.edges, s_vol)
-        cand = {
-            "baseline": (rows["sigma"][te] * math.sqrt(horizon), [base_q] * len(y)),
-            "vol": (s_vol, [vm.q_all] * len(y)),
-            "vol_binned": (s_vol, [vm.q_bins[b] for b in bins]),
-        }
+        cand = {"baseline": (rows["sigma"][te] * math.sqrt(horizon), [base_q] * len(y))}
+        for name, cols in (("vol", V_BASE), ("vol_bd", V_ALL)):
+            vm = VolModel().fit(rows["V"][tr][:, cols], rows["y"][tr])
+            s_vol = vm.sigma(rows["V"][te][:, cols])
+            bins = np.searchsorted(vm.edges, s_vol)
+            cand[name] = (s_vol, [vm.q_all] * len(y))
+            cand[name + "_binned"] = (s_vol, [vm.q_bins[b] for b in bins])
         for name, (s, qs) in cand.items():
             m = {}
             for level, (lo_k, hi_k) in BANDS.items():
@@ -735,7 +823,11 @@ def range_evaluate(rows: dict, horizon: int) -> dict:
         return {"method": "baseline", "methods": {}}
     methods = {name: {k: _r(_mean([x[k] for x in ms]) * 100, 2) for k in ms[0]} for name, ms in stats.items()}
     best = min(methods, key=lambda k: methods[k]["score"])
-    return {"method": best, "methods": methods}
+    plain = min((v["score"] for k, v in methods.items() if "_bd" not in k), default=None)
+    with_bd = min((v["score"] for k, v in methods.items() if "_bd" in k), default=None)
+    # interval-score change from adding the Bangladesh / political inputs (negative = better)
+    bd_gain = _r((with_bd / plain - 1) * 100, 1) if plain and with_bd else None
+    return {"method": best, "methods": methods, "bd_gain_pct": bd_gain}
 
 
 # ============================================================================ models
@@ -1016,6 +1108,7 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
         "news_items": db.scalar("SELECT COUNT(*) FROM news"),
         "inputs": [{"key": k, "label": l, "group": g} for k, l, _, g in FEATURES],
         "vol_inputs": VOL_INPUTS,
+        "vol_bd_inputs": VOL_BD_INPUTS,
         "group_labels": GROUP_LABELS,
         "horizons": {},
         "setup_rule": rule_backtest(ds),
@@ -1038,7 +1131,7 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
         meta["horizons"][str(h)] = {
             "label": label, "available": True, "n_rows": int(len(rows["y"])),
             "quantiles": band_quantiles(rows["y"], rows["sigma"], h),
-            "range_method": ranges["method"], "range_methods": ranges["methods"],
+            "range_method": ranges["method"], "range_methods": ranges["methods"], "bd_range_gain_pct": ranges.get("bd_gain_pct"),
             "backtest": backtest, "reliable": bool(backtest and backtest["reliable"]),
             "input_groups": input_group_test(rows, h, calendar, backtest) if group_test and h in (5, 20) else [],
         }

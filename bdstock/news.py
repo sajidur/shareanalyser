@@ -32,6 +32,9 @@ RECORD_RE = re.compile(
     r"record\s+date[^.;]{0,80}?(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}|\d{1,2}[\- ][A-Za-z]{3,9}[\- ,]+\d{4}|[A-Za-z]{3,9}\.? \d{1,2}, ?\d{4})",
     re.I,
 )
+NOCF_RE = re.compile(rf"NOCFPS\s+(?:was|were|is)\s+Tk\.?\s*({_NUM})\s+for\s+(.{{3,80}}?)\s+as\s+against\s+(?:Tk\.?\s*)?({_NUM})", re.I)
+NAVPS_RE = re.compile(rf"NAV per share(?:\s+[\w()-]+){{0,4}}?\s+(?:was|were|is)\s+Tk\.?\s*({_NUM})\s+as\s+on\s+(.{{3,40}}?)\s+and\s+(?:Tk\.?\s*)?({_NUM})", re.I)
+MFNAV_RE = re.compile(rf"NAV\)?\s+of\s+Tk\.?\s*({_NUM})\s+per\s+unit\s+on\s+the\s+basis\s+of\s+current\s+market\s+price", re.I)
 CASH_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(?:final\s+|interim\s+)?cash", re.I)
 STOCK_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(?:final\s+|interim\s+)?stock", re.I)
 RATE_RE = re.compile(r"rate of (\d+(?:\.\d+)?)\s*%", re.I)
@@ -89,6 +92,20 @@ def classify(type_: str | None, summary: str, body: str) -> dict:
                 eps_growth = 1.0 if cur > 0 else (-1.0 if cur < 0 else 0.0)
             tags.append("earnings")
             tone += eps_growth
+    def growth(m) -> float | None:
+        if not m:
+            return None
+        cur, prev = _tk(m.group(1)), _tk(m.group(3))
+        if cur is None or prev is None:
+            return None
+        if prev == 0:
+            return 1.0 if cur > 0 else (-1.0 if cur < 0 else 0.0)
+        return round(max(-1.0, min(1.0, (cur - prev) / abs(prev))), 4)
+
+    nocf_growth = growth(NOCF_RE.search(text))
+    nav_growth = growth(NAVPS_RE.search(text))
+    mf = MFNAV_RE.search(text)
+    mf_nav = _tk(mf.group(1)) if mf else None
     cash = CASH_RE.search(text)
     stock = STOCK_RE.search(text)
     if NO_DIV_RE.search(text):
@@ -120,6 +137,9 @@ def classify(type_: str | None, summary: str, body: str) -> dict:
         "eps_growth": None if eps_growth is None else round(eps_growth, 4),
         "record_date": record,
         "cash_pct": float((cash or RATE_RE.search(text)).group(1)) if "dividend" in tags and (cash or RATE_RE.search(text)) else None,
+        "nocf_growth": nocf_growth,
+        "nav_growth": nav_growth,
+        "mf_nav": mf_nav,
     }
 
 
@@ -130,10 +150,12 @@ def _strip_code(code: str, summary: str) -> str:
 
 
 NEWS_UPSERT = """INSERT INTO news (uid, code, news_date, news_time, type, summary, body, tags, tone, eps_growth,
-    record_date, source, fetched_at)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+    record_date, source, nocf_growth, nav_growth, mf_nav, fetched_at)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
 ON DUPLICATE KEY UPDATE
     news_time=COALESCE(news_time, VALUES(news_time)),
+    nocf_growth=COALESCE(VALUES(nocf_growth), nocf_growth), nav_growth=COALESCE(VALUES(nav_growth), nav_growth),
+    mf_nav=COALESCE(VALUES(mf_nav), mf_nav),
     tags=IF(LENGTH(VALUES(body)) >= LENGTH(COALESCE(body, '')), VALUES(tags), tags),
     tone=IF(LENGTH(VALUES(body)) >= LENGTH(COALESCE(body, '')), VALUES(tone), tone),
     eps_growth=IF(LENGTH(VALUES(body)) >= LENGTH(COALESCE(body, '')), VALUES(eps_growth), eps_growth),
@@ -152,8 +174,22 @@ def store(code: str, items: Iterable[dict], source: str) -> int:
         uid = hashlib.sha1(f"{code}|{d.isoformat()}|{summary.lower()}".encode("utf-8")).hexdigest()
         c = classify(it.get("type"), summary, body)
         rows.append((uid, code, d, it.get("time"), (it.get("type") or "")[:32], summary[:500], body,
-                     ",".join(c["tags"])[:255], c["tone"], c["eps_growth"], c["record_date"], source))
+                     ",".join(c["tags"])[:255], c["tone"], c["eps_growth"], c["record_date"], source,
+                     c["nocf_growth"], c["nav_growth"], c["mf_nav"]))
     return db.executemany(NEWS_UPSERT, rows)
+
+
+def reparse_all() -> int:
+    """Re-run the rule-based parser over stored announcements (after the parser gains new fields)."""
+    rows = db.query("SELECT uid, type, summary, body FROM news")
+    upd = []
+    for r in rows:
+        c = classify(r["type"], r["summary"] or "", r["body"] or "")
+        upd.append((",".join(c["tags"])[:255], c["tone"], c["eps_growth"], c["record_date"],
+                    c["nocf_growth"], c["nav_growth"], c["mf_nav"], r["uid"]))
+    db.executemany("UPDATE news SET tags=%s, tone=%s, eps_growth=%s, record_date=%s, nocf_growth=%s, nav_growth=%s, "
+                   "mf_nav=%s WHERE uid=%s", upd)
+    return len(upd)
 
 
 def fetch_latest() -> list[str]:
@@ -192,19 +228,23 @@ def latest(limit: int = 30, code: str | None = None, codes: list[str] | None = N
 # ---------------------------------------------------------------------------- features
 
 def load_events() -> dict[str, list[tuple]]:
-    """code -> [(news_date, tone, eps_growth, has_dividend, has_no_dividend, record_date, ai_impact)]."""
+    """code -> [(news_date, tone, eps_growth, has_dividend, has_no_dividend, record_date, ai_impact,
+    nocf_growth, nav_growth, mf_nav)] sorted by date."""
     out: dict[str, list[tuple]] = defaultdict(list)
-    for r in db.query("SELECT code, news_date, tone, eps_growth, tags, record_date, ai_impact FROM news ORDER BY code, news_date"):
+    for r in db.query("SELECT code, news_date, tone, eps_growth, tags, record_date, ai_impact, nocf_growth, nav_growth, "
+                      "mf_nav FROM news ORDER BY code, news_date"):
         tags = (r["tags"] or "").split(",")
         out[r["code"]].append((r["news_date"], r["tone"] or 0.0, r["eps_growth"], "dividend" in tags,
-                               "no_dividend" in tags, r["record_date"], r["ai_impact"]))
+                               "no_dividend" in tags, r["record_date"], r["ai_impact"],
+                               r["nocf_growth"], r["nav_growth"], r["mf_nav"]))
     return out
 
 
 def features(dates: list[date], events: list[tuple]) -> dict[str, list[float]]:
     """Point-in-time news features for each date (uses only announcements dated on/before it)."""
     n = len(dates)
-    out = {k: [0.0] * n for k in ("news_cnt", "news_tone", "eps_surprise", "div_event", "record_soon", "ai_news")}
+    out = {k: [0.0] * n for k in ("news_cnt", "news_tone", "eps_surprise", "div_event", "record_soon", "ai_news",
+                                  "nocf_g", "navps_g", "mf_nav")}
     if not events:
         return out
     ev_dates = [e[0] for e in events]
@@ -220,6 +260,17 @@ def features(dates: list[date], events: list[tuple]) -> dict[str, list[float]]:
         for e in reversed(events[lo90:hi]):
             if e[2] is not None:
                 out["eps_surprise"][i] = e[2]
+                break
+        lo120 = bisect.bisect_right(ev_dates, t - timedelta(days=120))
+        lo14 = bisect.bisect_right(ev_dates, t - timedelta(days=14))
+        for e in reversed(events[lo120:hi]):  # latest results: cash flow and NAV per share vs last year
+            if len(e) > 8 and (e[7] is not None or e[8] is not None):
+                out["nocf_g"][i] = e[7] or 0.0
+                out["navps_g"][i] = e[8] or 0.0
+                break
+        for e in reversed(events[lo14:hi]):   # mutual funds publish NAV at market price weekly/daily
+            if len(e) > 9 and e[9]:
+                out["mf_nav"][i] = e[9]
                 break
         recent = events[lo30:hi]
         out["ai_news"][i] = max(-4.0, min(4.0, float(sum(e[6] or 0 for e in recent if len(e) > 6))))

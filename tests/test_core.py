@@ -9,6 +9,8 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -344,6 +346,24 @@ class NewsTests(unittest.TestCase):
         op = news.classify("Notice", "Operating update", "operating results were discussed")
         self.assertNotIn("rating", op["tags"])
 
+    def test_classify_cash_flow_nav_and_fund_nav(self):
+        from bdstock import news
+
+        q = news.classify("Financials", "Q1 Financials",
+                          "(Q1 Un-audited): Consolidated EPS was Tk. 3.43 for July-September 2024 as against Tk. 2.70 for "
+                          "July-September 2023; Consolidated NOCFPS was Tk. 2.85 for July-September 2024 as against Tk. (2.65) "
+                          "for July-September 2023. Consolidated NAV per share was Tk. 51.46 as on September 30, 2024 and "
+                          "Tk. 48.03 as on June 30, 2024.")
+        self.assertAlmostEqual(q["eps_growth"], (3.43 - 2.70) / 2.70, places=4)
+        self.assertEqual(q["nocf_growth"], 1.0)  # negative to positive cash flow, capped
+        self.assertAlmostEqual(q["nav_growth"], round((51.46 - 48.03) / 48.03, 4), places=4)
+        self.assertIsNone(q["mf_nav"])
+        mf = news.classify("NAV", "Weekly NAV",
+                           "On the close of operation on 18-Oct-2026, the Fund has reported Net Asset Value (NAV) of Tk. 8.17 "
+                           "per unit on the basis of current market price and Tk. 12.13 per unit on the basis of cost price.")
+        self.assertEqual(mf["mf_nav"], 8.17)
+        self.assertIsNone(mf["nocf_growth"])
+
     def test_news_features_point_in_time(self):
         from bdstock import news
 
@@ -462,6 +482,90 @@ class BangladeshFactorTests(unittest.TestCase):
         self.assertEqual(f["bd_sponsor"][2], -1.0)
         self.assertEqual(f["bd_toz"][2], 1.0)
         self.assertEqual(f["bd_toz"][3], 0.0)                         # older than 60 days
+
+    def test_classify_political_footprint(self):
+        from bdstock import bdfactors as bf
+
+        self.assertIn("state_control", bf.classify_news(
+            "Dissolved Board of Directors", "Bangladesh Bank vide letter dated August 18, 2026 has dissolved the Board of Directors"))
+        self.assertIn("state_control", bf.classify_news(
+            "Appointment of Observer", "Bangladesh Bank has nominated Mr. X as its representative to act as an Observer on the Board"))
+        self.assertIn("state_control", bf.classify_news(
+            "Reconstitution", "Bangladesh Bank has reconstituted the Board of Directors of the Bank vide letter dated 13 May, 2026"))
+        # a board change by the owners themselves is not state control
+        self.assertNotIn("state_control", bf.classify_news(
+            "Completion of transfer of shares & reconstitution of new Board",
+            "The Board of Directors has noted the completion of the off-market transfer of shares and reconstituted the Board"))
+        self.assertIn("political_hit", bf.classify_news(
+            "Q2 Financials", "NOCFPS was lower, primarily caused by the political unrest and nationwide disruptions"))
+        self.assertIn("political_hit", bf.classify_news("Q3 Financials", "revenue growth was restrained due to socio-political factors"))
+        self.assertIn("court_hold", bf.classify_news(
+            "Rescheduling of AGM", "pursuant to the Hon'ble High Court Division's Order Number 6957, the AGM will be held"))
+        self.assertNotIn("regulator", bf.classify_news("Appointment of Administrator", "Administrator appointed by Bangladesh Bank"))
+        self.assertIn("wipeout", bf.classify_news(
+            "Reduction of entire Paid-up Capital to 0 by Order of Bangladesh Bank",
+            "the entire paid-up capital of Union Bank PLC. amounting to BDT 1036,28,04,480 is reduced to zero (0)"))
+        self.assertIn("wipeout", bf.classify_news(
+            "Suspension of Trading", "Bangladesh Bank has declared the bank as non-viable (okarjokar) with effect from November 5, 2025"))
+
+    def test_ai_political_score_capped_by_filings(self):
+        from bdstock import llm
+
+        today = date(2026, 11, 23)
+        self.assertEqual(llm.political_cap([], today), 2)
+        self.assertEqual(llm.political_cap([(date(2025, 12, 28), "wipeout")], today), -2)
+        self.assertEqual(llm.political_cap([(date(2026, 8, 19), "state_control")], today), -2)
+        self.assertEqual(llm.political_cap([(date(2025, 6, 1), "state_control")], today), -1)   # over a year ago
+        self.assertEqual(llm.political_cap([(date(2026, 11, 22), "court_hold")], today), 0)
+
+    def test_political_event_features_windows(self):
+        from bdstock import bdfactors as bf
+
+        ev = [(date(2026, 1, 10), "state_control"), (date(2026, 1, 10), "court_hold"), (date(2026, 1, 10), "political_hit")]
+        f = bf.event_features([date(2026, 1, 9), date(2026, 3, 1), date(2026, 5, 1), date(2026, 6, 1), date(2026, 8, 1)], ev)
+        self.assertEqual(f["bd_state"], [0.0, 1.0, 1.0, 1.0, 0.0])    # active 180 days
+        self.assertEqual(f["bd_polhit"], [0.0, 1.0, 1.0, 0.0, 0.0])   # 120 days
+        self.assertEqual(f["bd_court"], [0.0, 1.0, 0.0, 0.0, 0.0])    # 90 days
+
+    def test_political_link_validation(self):
+        from bdstock import bdfactors as bf
+
+        with self.assertRaises(ValueError):
+            bf.add_link({"code": "GP", "exposure": "guess", "source": "x"})
+        with self.assertRaises(ValueError):  # a source is required
+            bf.add_link({"code": "GP", "exposure": "former_govt", "source": " "})
+        with self.assertRaises(ValueError):
+            bf.add_link({"code": "GP", "exposure": "former_govt", "source": "paper", "since": "13/05/2026"})
+
+    def test_shock_beta_point_in_time(self):
+        from bdstock import predict
+
+        mret = np.array([0.0, -0.02, 0.01, -0.03, 0.0] * 20)
+        r1 = mret * 2.0                       # always moves twice the market
+        b = predict.shock_beta_series(r1, mret, np.ones(len(mret), dtype=bool))
+        self.assertEqual(b[0], 1.0)          # no sell-off day yet: neutral
+        self.assertAlmostEqual(b[-1], 0.8 * 2 + 0.2)   # 40 sell-off days: weight 40/(40+10) towards the raw 2.0
+        self.assertLess(b[3], b[-1])         # shrunk while there are few days
+        self.assertTrue(np.all(np.diff(b[mret <= -0.01]) >= -1e-12))
+
+    def test_range_model_with_bd_inputs(self):
+        from bdstock import predict
+
+        rng = np.random.default_rng(3)
+        n = 5000
+        V = rng.normal(size=(n, len(predict.V_ALL)))
+        y = rng.normal(size=n) * np.exp(-4 + 0.3 * V[:, 0] + 0.4 * V[:, len(predict.V_BASE)])
+        rows = {"V": V, "y": y, "sigma": np.full(n, 0.02)}
+        r_plain = predict.Ranger("vol", rows, 1)
+        r_bd = predict.Ranger("vol_bd_binned", rows, 1)
+        self.assertEqual(len(r_plain.vm.b), len(predict.V_BASE) + 1)
+        self.assertEqual(len(r_bd.vm.b), len(predict.V_ALL) + 1)
+        self.assertGreater(abs(r_bd.vm.b[1 + len(predict.V_BASE)]), 0.1)   # picks up the BD input
+        st = {"V": V, "f": {"_sigma": np.full(n, 0.02), "vol20": np.full(n, 0.02)}}
+        s, q = r_bd.at(st, 10)
+        self.assertGreater(s, 0)
+        self.assertIn("q25", q)
+        self.assertEqual(predict.Ranger("unknown", rows, 1).method, "baseline")
 
 
 class PaperTradeTests(unittest.TestCase):

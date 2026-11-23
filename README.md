@@ -104,17 +104,25 @@ has never seen. Code: `bdstock/predict.py`.
   (yield + years paid out of 5) 25%, EPS growth 20%, stability (low volatility + long-term trend) 30%.
   At most 3 per sector. It suits buying a fixed amount every month. It cannot be backtested because
   DSE publishes only current fundamentals.
-* **Inputs (49, in 10 groups, all point-in-time):** price and volume (technical), liquidity and DSE
-  category, market conditions (momentum, breadth, turnover trend), sector strength, fundamentals
+* **Inputs (68, in 13 groups, all point-in-time):** price and volume (technical), liquidity and DSE
+  category, market conditions (momentum, breadth, turnover trend, share of market turnover in
+  category Z and small shares, a speculation gauge), sector strength, fundamentals
   (earnings yield, book/price, dividend yield, EPS growth, each used only from ~120 days after the
   fiscal year end, when it was published), **news** (announcements in the last 7 days, 30-day
-  tone, latest earnings vs last year, dividend declared / no dividend, record date within 10 days),
-  **trading activity** (close position in the day's range, opening gap, intraday high-low range,
-  average trade size and number of trades vs normal, up/down streak, circuit-limit days),
-  **risk** (60-day beta, stock-specific volatility, distance from 52-week high/low), **ownership & size**
-  (market cap, sponsor / institutional / foreign holding from the dated shareholding reports, free float)
-  and **day of week** (Sunday / Thursday sessions). Each group is re-tested daily *with and without it*,
-  and the Prediction page shows what it really adds.
+  tone, latest earnings vs last year, dividend declared / no dividend, record date within 10 days,
+  local-AI news score), **trading activity** (close position in the day's range, opening gap, intraday
+  high-low range, average trade size and number of trades vs normal, up/down streak, circuit-limit days,
+  consecutive circuit days), **risk** (60-day beta, stock-specific volatility, distance from 52-week
+  high/low), **ownership & size** (market cap, sponsor / institutional / foreign holding from the dated
+  shareholding reports, free float), **Bangladesh events** (DSE unusual-movement query, rumour
+  clarification, sponsor buy/sell declarations, downgrade to Z, margin-loan ban, government/regulator
+  news), **quality** (operating cash flow per share and NAV per share vs last year from the latest
+  results, earnings yield and book/price vs the sector median, mutual-fund price vs its weekly NAV),
+  **political & state influence** (government holding, central bank / regulator takeover, court order,
+  political disruption in results, fall on sell-off days) and **day of week** (Sunday / Thursday
+  sessions). Each group is re-tested daily *with and without it*, and the Prediction page shows what it
+  really adds. So far liquidity, activity and ownership help; the Bangladesh, political, quality and news
+  groups add about nothing measurable on one year of history.
 * **Range width.** Three range methods are tested every day on unseen windows: 60-day volatility × √days,
   a volatility model (17 inputs), and the volatility model with separate scaling for calm/jumpy stocks.
   The one with the best interval score (width plus a penalty for misses) is used. The Prediction page
@@ -144,8 +152,28 @@ Measured on DSE history every day; only effects with real evidence change the bu
   time exit, after commission). See the live record on the Prediction and Accuracy pages before
   trusting real money.
 
-Political influence is measured only through its footprint in prices and disclosures. No company is
-labelled as politically connected.
+* **Political & state influence:**
+  * From DSE filings: the central bank or regulator taking control of a board (dissolution,
+    administrator, observer, bank resolution), court orders holding up an AGM, dividend or control, and
+    companies saying political unrest hurt their results, and banks / finance companies declared non-viable or whose shareholders' capital was written off (bank resolution). Each is an event study like the others,
+    and stays "active" for a while (takeovers 180 days, political disruption 120, court orders 90, write-offs for good). First results: takeovers −3.6% vs the market over 20 sessions
+    (15 cases), political-disruption mentions −6.4% (9 cases), court orders about 0; all still weak evidence.
+  * Government shareholding from the DSE shareholding report (30 state-owned / state-backed companies).
+  * **Fall on sell-off days:** how hard each share fell, relative to the market, on days the market
+    dropped 1% or more (political and macro shocks). Shrunk towards 1 while there are few such days.
+  * **Your records:** on the BD factors page you can record a political exposure of a company's owners
+    or sponsors (linked to the former / current government, opposition, state-appointed board, owners
+    under investigation), always with a source. Records are measured as a group (marked "hindsight",
+    because you choose them knowing what happened). "Former government" and "under investigation"
+    records keep the share out of ACCUMULATE, and every plan for that share shows the record.
+  * These enter the predictor as a 5-input "political" group (government holding, takeover, court order,
+    political disruption, sell-off sensitivity) and as optional inputs of the range model. Both are
+    tested daily on unseen data. So far neither improves the forecasts measurably, so the daily test
+    keeps the simpler range model for the short horizons.
+
+Political influence is measured only through its footprint in prices and disclosures. The tool never
+guesses anyone's political affiliation (from names or otherwise); only your own sourced records
+label a company.
 
 ### Short-term and long-term date ranges
 
@@ -166,10 +194,10 @@ Every share gets a plan on its Prediction page, and the overview lists today's s
 
 | Parameter | How it is set |
 |---|---|
-| **Signal** | BUY (uptrend pullback + reward:risk ≥ 1.5 + positive historical EV + liquid, not Z) · ACCUMULATE (long-term score ≥ 70) · HOLD / TAKE PROFIT / SELL for your holdings · AVOID (downtrend, seriously negative news, illiquid) · WAIT |
+| **Signal** | BUY (uptrend pullback + reward:risk ≥ 1.5 + positive historical EV + liquid, not Z) · ACCUMULATE (long-term score ≥ 70, no AI red flag) · for your holdings: HOLD / TAKE PROFIT (stretched and in profit) / REDUCE (downtrend, or stretched while at a loss) / SELL (below trend stop, strong BD risk event) · AVOID (downtrend, seriously negative news, illiquid) · WAIT · SUSPENDED (no trades for 20 sessions: the price is stale; shows any non-viable / capital write-off filing) |
 | **Buy zone** | limit prices with about a 50% / 70% chance of being filled next session (measured next-day lows) |
 | **Sell zone** | limit prices the next session reaches about 50% / 30% of the time (measured next-day highs) |
-| **Stop-loss** | price − 1.5 × ATR(14); holders get a trailing stop = highest close since buying − 2.5 × ATR |
+| **Stop-loss** | price − 1.5 × ATR(14); holders get a trend stop = highest close of the last 60 sessions − 2.5 × ATR |
 | **Targets** | T1 = top of the 1-week 50% range, T2 = top of the 1-month 68% range |
 | **Win rate / EV** | from every liquid share's daily highs/lows in the past year: how often T2 was reached before the stop within 20 sessions, and the average result per trade |
 | **Position size** | shares = min(capital × risk% ÷ (entry − stop), capital × max% ÷ entry). Set capital and risk in Settings |
@@ -182,12 +210,32 @@ all shares. Win rates are below 50% by design (winners are larger than losers), 
 
 ### Local AI (Ollama)
 
-If Ollama is running (`config.ini` [ollama], default model `gemma3:4b`), the tool uses it locally to
-(1) rate each non-routine announcement from −2 to +2. This becomes the "AI news score" model input and is
-tested like every other input. The end-of-day run spends up to `ai_daily_minutes` (Settings) on new news,
-and Settings has a button to rate the backlog. (2) It writes a plain-language analyst note on any
-stock's Prediction page from the numbers already computed. The AI never sets ranges or signals, and
-small local models can misread facts, so the numbers on the page are what count.
+If Ollama is running (`config.ini` [ollama], default model `gemma3:4b`), the tool uses it locally for:
+
+1. **News rating:** each non-routine announcement gets a score from −2 to +2. This becomes the
+   "AI news score" model input and is tested like every other input. The end-of-day run spends up to
+   `ai_daily_minutes` (Settings) on new news; Settings has a button to rate the backlog.
+2. **Company health check** (Prediction page): reads the company's DSE announcements, multi-year EPS,
+   dividends and shareholding, and scores governance, financial health, growth, dividend reliability,
+   news flow and **political / state risk** from −2 to +2, with positives, risks and a summary. The
+   political score uses only what the filings show (government holding, takeovers, court orders,
+   political disruption); the model is told never to guess anyone's political affiliation. It runs daily
+   for holdings, watchlist, signals and liquid shares (up to `ai_profile_minutes`), and is refreshed when
+   new news arrives or after 14 days. A score of −2 on governance, financial health or political / state
+   risk is a **red flag**: the share cannot get an ACCUMULATE signal and the plan shows a caution.
+3. **Market brief** (Daily reports): a short summary written after each end-of-day run.
+4. **Portfolio review** (Portfolio page): a plain-language review of your holdings, the tool's
+   signals and the health checks.
+5. **Analyst note** (Prediction page): explains the numbers already on the page.
+
+The model is given plain fact sentences with numbers already formatted, and is told not to add any
+number or cause that is not in them (small models misread raw tables). The AI never sets ranges or
+signals except for the red-flag block above. It can still misread facts, so the numbers on the page
+are what count; the health check is not back-tested.
+
+`analysis_model` (optional, in `[ollama]`) sets a different model for items 2–5. On this PC (no
+graphics card) `gemma3:4b` takes about 7 s per news rating, 2–3 minutes per health check and 3–5 minutes
+per portfolio review; `gemma4:12b` ran at about 1.4 words per second, too slow to use without a GPU.
 
 ### Formulas
 
@@ -197,7 +245,7 @@ small local models can misread facts, so the numbers on the page are what count.
 2. Shape of moves   z = ln(P[t+h]/P[t]) / σ̂_h  over all past stock-days;  q_p = p-th percentile of z
 3. Range (conf. c)  Low = P[t]·exp(q_(1−c)/2 · σ̂_h)   High = P[t]·exp(q_(1+c)/2 · σ̂_h)   Mid = P[t]·exp(q_0.5 · σ̂_h)
                     50% range: q25..q75   68%: q16..q84   90%: q5..q95
-4. Direction        z_i = (clip(x_i) − mean_i) / sd_i                      (49 inputs, clipped to 1st–99th pct)
+4. Direction        z_i = (clip(x_i) − mean_i) / sd_i                      (68 inputs, clipped to 1st–99th pct)
                     P(up) = 1 / (1 + exp(−(w0 + Σ w_i·z_i)))              (logistic regression, L2 penalty)
                     E[ln(P[t+h]/P[t])] = β0 + Σ β_i·z_i                    (ridge regression, λ = 0.1·n)
 5. Shown only if    rank-IC > 0.03 in each of 3 unseen 15-session windows, AUC > 0.53, top-10 beat average

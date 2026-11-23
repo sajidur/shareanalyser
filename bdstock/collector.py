@@ -234,6 +234,13 @@ def run_daily(force: bool = False, notify: bool = True, progress: Progress = Non
             events = alerts.check_eod(snap.trade_date)
             rep = report.build(snap.trade_date)
             report.save(snap.trade_date, rep)
+            if llm.status()["available"]:
+                brief = _safe(lambda: llm.market_brief(rep), "AI market brief")
+                if brief:
+                    rep["ai_brief"] = brief
+                    report.save(snap.trade_date, rep)
+                _safe(lambda: llm.profile_batch(max_minutes=user_settings.get_float("ai_profile_minutes")),
+                      "AI health checks")
             notified = False
             if notify and not report.was_notified(snap.trade_date):
                 title, body = report.headline(rep)

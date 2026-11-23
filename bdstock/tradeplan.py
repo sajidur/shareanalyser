@@ -32,7 +32,7 @@ LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0]   # distances
 WINDOWS = (5, 20)
 NEXT_PCTS = [10, 20, 30, 50, 70, 80, 90]
 TICK = 0.10   # DSE price step (Tk)
-SIGNAL_ORDER = ["BUY", "ACCUMULATE", "TAKE PROFIT", "SELL", "REDUCE", "HOLD", "AVOID", "WAIT"]
+SIGNAL_ORDER = ["BUY", "ACCUMULATE", "TAKE PROFIT", "SELL", "REDUCE", "HOLD", "AVOID", "WAIT", "SUSPENDED"]
 
 
 def floor_tick(x: float) -> float:
@@ -228,7 +228,15 @@ def _load_context(codes: list[str] | None = None) -> dict:
     s = settings.get_all()
     upcoming_record = {r["code"]: r["d"] for r in db.query(
         "SELECT code, MIN(record_date) AS d FROM news WHERE record_date > CURDATE() GROUP BY code")}
+    from . import bdfactors, llm
+
+    links: dict[str, list] = defaultdict(list)
+    for lk in bdfactors.political_links():
+        links[lk["code"]].append(lk)
+    last_trade = {r["code"]: r["d"] for r in db.query(
+        f"SELECT code, MAX(trade_date) AS d FROM daily_prices WHERE volume > 0{where} GROUP BY code", params)}
     return {
+        "profiles": llm.get_profiles(codes), "links": links, "last_trade": last_trade,
         "bd": db.get_state("bd_factors") or {}, "upcoming_record": upcoming_record,
         "date": d, "days": predict.next_trading_days(d, 245) if d else [],
         "bars": bars, "preds": preds, "sigs": sigs, "inst": inst, "bad_news": bad_news,
@@ -301,11 +309,13 @@ def _plan(code: str, ctx: dict) -> dict | None:
     bd = ctx.get("bd") or {}
     studies = bd.get("studies", {})
     bd_notes, bd_block = [], None
+    from . import bdfactors
+
     for iso, kind in (bd.get("recent_events") or {}).get(code, []):
         d0 = date.fromisoformat(iso)
-        age = (ctx["date"] - d0).days if ctx["date"] else 99
+        age = (ctx["date"] - d0).days if ctx["date"] else 999
         stt = studies.get(kind, {})
-        if age > 28 or not stt.get("n"):
+        if age > bdfactors.active_days(kind) or not stt.get("n"):
             continue
         line = (f"{stt['label']} on {d0:%d %b}: afterwards shares typically did {stt.get('ex20', 0):+.1f}% vs the market "
                 f"over 20 sessions (median of {stt['n']} cases, {stt.get('evidence')} evidence)")
@@ -317,13 +327,43 @@ def _plan(code: str, ctx: dict) -> dict | None:
     regime = (bd.get("regime_now") or {}).get("regime")
     rstat = (bd.get("regime_stats") or {}).get(regime or "", {})
     market_stress = regime == "Stress" and (rstat.get("fwd20") or 0) < 0
+    prof = (ctx.get("profiles") or {}).get(code)
+    ai_red = bool(prof and any(prof.get(k, 0) <= -2 for k in ("governance", "financial_health", "political_exposure")))
+    # political exposure the user recorded (their own research, with a source); measured as a group
+    pol = bd.get("political") or {}
+    links = (ctx.get("links") or {}).get(code, [])
+    pol_risky = [lk for lk in links if lk["exposure"] in bdfactors.RISKY_EXPOSURES]
+    pol_notes = []
+    for lk in links:
+        g = ((pol.get("groups") or {}).get("link_" + lk["exposure"]) or {}).get("all") or {}
+        who = f" ({lk['person']})" if lk.get("person") else ""
+        pol_notes.append(f"Your record: {bdfactors.EXPOSURES.get(lk['exposure'], lk['exposure'])}{who}"
+                         + (f". Shares you marked this way did {g['ex20']:+.1f}% vs the market over 20 sessions "
+                            f"(median, {g['samples']} cases; chosen with hindsight)" if g.get("ex20") is not None else ""))
+    shock = (pol.get("shock") or {}).get(code)
+    shock_hi = bool(shock and (shock.get("beta") or 0) >= 1.5 and regime in ("Nervous", "Stress"))
     rec_date = ctx.get("upcoming_record", {}).get(code)
     rec_neg = (studies.get("record_date") or {}).get("direction") == "negative"
     record_soon = bool(rec_date and ctx["date"] and 0 < (rec_date - ctx["date"]).days <= 14 and rec_neg)
 
+    # not trading for a month: suspended (e.g. bank resolution) or nobody trades it. The price is stale.
+    suspended = all((b.get("volume") or 0) <= 0 for b in bars[-20:])
+    last_trade = ctx.get("last_trade", {}).get(code)
+    wipe = [(date.fromisoformat(iso), k) for iso, k in ((pol.get("events") or {}).get(code) or []) if k == "wipeout"]
+
     reasons: list[str] = []
     trail = None
-    if holding:
+    if suspended:
+        signal = "SUSPENDED"
+        reasons.append((f"Not traded since {last_trade:%d %b %Y}" if last_trade else "No trades in the last 20 sessions")
+                       + ": trading is suspended or nobody is trading it, so the price shown is stale and the ranges mean nothing")
+        if wipe:
+            d0 = max(wipe)[0]
+            reasons.append(f"Filing of {d0:%d %b %Y}: {bdfactors.EVENT_TYPES['wipeout'][0]}. "
+                           "Existing shares are probably worth nothing; read the filing")
+        if holding:
+            reasons.append("You cannot sell until trading resumes; follow the company's and the regulator's notices")
+    elif holding:
         # Decide on the outlook, not on the purchase price (positions are often entered later,
         # with an old cost). Trend stop = highest close of the last 60 sessions - 2.5 x ATR.
         recent = [float(b["close"]) for b in bars[-60:]] or [c]
@@ -341,8 +381,14 @@ def _plan(code: str, ctx: dict) -> dict | None:
             signal = "SELL"
             reasons.append("Downtrend plus seriously negative news")
         elif (t1 and c >= t1) or (rsi and rsi > 75) or "bb_above" in flags:
-            signal = "TAKE PROFIT"
-            reasons.append("Stretched: at the upper target / RSI above 75 / above the upper Bollinger band")
+            if (holding.get("unrealized_pct") or 0) >= 0:
+                signal = "TAKE PROFIT"
+                reasons.append("Stretched: at the upper target / RSI above 75 / above the upper Bollinger band")
+            else:
+                # "take profit" reads wrongly on a losing position: this is a better-than-usual price to cut size
+                signal = "REDUCE"
+                reasons.append("Stretched (at the upper target / RSI above 75 / above the upper Bollinger band): "
+                               "a better-than-usual price to sell part of the position")
         elif (bearish or c <= trail) and quality:
             signal = "HOLD"
             reasons.append(f"Trend is down, but long-term quality/value score is {long_score:.0f}/100: "
@@ -391,7 +437,7 @@ def _plan(code: str, ctx: dict) -> dict | None:
             signal = "BUY"
             reasons.append("Uptrend pullback setup (above 50-day avg, RSI 40-65, near 20-day avg)")
             reasons.append(f"Reward:risk 1:{rr2:.1f} to T2 with a positive historical expected value")
-    elif long_score is not None and long_score >= 70 and not at_circuit:
+    elif long_score is not None and long_score >= 70 and not at_circuit and not ai_red and not pol_risky:
         signal = "ACCUMULATE"
         reasons.append(f"Long-term quality/value score {long_score:.0f}/100: suited to regular buying")
     else:
@@ -406,8 +452,19 @@ def _plan(code: str, ctx: dict) -> dict | None:
     for note in bd_notes:
         if not bd_block or note != bd_block[1]:
             reasons.append(note)
+    if ai_red:
+        area = next(k for k in ("governance", "financial_health", "political_exposure") if prof.get(k, 0) <= -2).replace("_", " ").replace("exposure", "/ state risk")
+        reasons.append(f"AI health check (local LLM, {prof.get('as_of')}) flags serious {area} concerns"
+                       + (f": {prof['risks'][0]}" if prof.get("risks") else "") + " (not back-tested; check the filings)")
     if spec and spec["score"] >= 30 and signal not in ("AVOID",):
         reasons.append(f"Speculation risk {spec['score']}/100: {', '.join(spec['why'][:3])}")
+    reasons.extend(pol_notes)
+    if pol_risky and not holding and long_score is not None and long_score >= 70 and signal == "WAIT":
+        reasons.append("Not marked ACCUMULATE because of the political exposure you recorded: state action "
+                       "(asset freezes, board takeovers) can hit such companies suddenly")
+    if shock_hi and signal != "SUSPENDED":
+        reasons.append(f"Market is {regime}: on past sell-off days this share fell {shock['beta']:.1f}× as much as "
+                       "the market; expect bigger drops while the market is uneasy")
 
     days = ctx["days"]
 
@@ -437,7 +494,9 @@ def _plan(code: str, ctx: dict) -> dict | None:
         "code": code, "name": inst.get("name"), "sector": inst.get("sector"), "category": inst.get("category"),
         "date": ctx["date"], "close": c, "signal": signal, "reasons": reasons, "dates": dates,
         "bd": {"spec": spec, "regime": regime, "regime_fwd20": rstat.get("fwd20"), "record_date": rec_date,
-               "events": bd_notes, "blocked_by": bd_block[0] if bd_block else None},
+               "events": bd_notes, "blocked_by": bd_block[0] if bd_block else None,
+               "political_links": [lk["exposure"] for lk in links], "shock_beta": (shock or {}).get("beta")},
+        "ai_red_flag": ai_red,
         "score": score, "label": s.get("label"), "rsi": _r(rsi, 1), "long_score": long_score,
         "sigma_pct": _r(sigma * 100, 2), "atr": _r(atr), "liq_mn": _r(liq, 1),
         "buy_zone": [buy_deep, buy_easy] if buy_deep and buy_easy else None,

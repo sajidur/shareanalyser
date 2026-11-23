@@ -305,6 +305,7 @@ def create_app(start_monitor: bool = False) -> Flask:
         note = llm.cached_note(code, fc["trade_date"]) if fc else None
         return jsonify(
             bd=bdfactors.stock_view(code),
+            ai_profile=llm.get_profiles([code]).get(code),
             plan=plan,
             intraday=intraday,
             ai_note=note,
@@ -341,14 +342,25 @@ def create_app(start_monitor: bool = False) -> Flask:
                       key=lambda kv: -kv[1]["score"])[:25]
         names = {r["code"]: r["name"] for r in db.query("SELECT code, name FROM instruments")}
         recent = db.query(
-            "SELECT code, news_date, summary, LEFT(body, 400) AS body FROM news WHERE news_date >= CURDATE() - INTERVAL 30 DAY "
+            "SELECT code, news_date, summary, LEFT(body, 3000) AS body FROM news WHERE news_date >= CURDATE() - INTERVAL 30 DAY "
             "ORDER BY news_date DESC, news_time DESC LIMIT 600")
         flagged = []
         for r in recent:
             kinds = bdfactors.classify_news(r["summary"] or "", r["body"] or "")
             if kinds:
-                flagged.append({**r, "kinds": kinds, "name": names.get(r["code"])})
+                flagged.append({**r, "body": (r["body"] or "")[:400], "kinds": kinds, "name": names.get(r["code"])})
+        pol = st.get("political") or {}
+        shock = sorted(((c, v) for c, v in (pol.get("shock") or {}).items() if v["days"] >= 10),
+                       key=lambda kv: -kv[1]["beta"])[:15]
+        govt = sorted((pol.get("govt_hold") or {}).items(), key=lambda kv: -kv[1])
+        pol_events = sorted(((d, c, t) for c, evs in (pol.get("events") or {}).items() for d, t in evs), reverse=True)[:40]
         return jsonify(
+            political={k: pol.get(k) for k in ("shock_day_pct", "shock_days", "groups")},
+            shock_top=[{"code": c, "name": names.get(c), **v} for c, v in shock],
+            govt_top=[{"code": c, "name": names.get(c), "govt_hold": g, **((pol.get("shock") or {}).get(c) or {})} for c, g in govt],
+            political_events=[{"date": d, "code": c, "type": t, "name": names.get(c)} for d, c, t in pol_events],
+            links=[{**lk, "name": names.get(lk["code"])} for lk in bdfactors.political_links()],
+            exposures=bdfactors.EXPOSURES,
             built_at=st.get("built_at"), history_from=st.get("history_from"), history_to=st.get("history_to"),
             studies=st.get("studies", {}), regime_now=st.get("regime_now"), regime_stats=st.get("regime_stats", {}),
             regime_history=st.get("regime_history", []), events=st.get("events", []),
@@ -370,6 +382,21 @@ def create_app(start_monitor: bool = False) -> Flask:
     @app.delete("/api/bd/events/<int:event_id>")
     def bd_event_delete(event_id: int):
         bdfactors.delete_event(event_id)
+        JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
+        return jsonify(ok=True)
+
+    @app.post("/api/bd/links")
+    def bd_link_add():
+        try:
+            new_id = bdfactors.add_link(_body())
+        except ValueError as e:
+            abort(400, str(e))
+        JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
+        return jsonify(id=new_id)
+
+    @app.delete("/api/bd/links/<int:link_id>")
+    def bd_link_delete(link_id: int):
+        bdfactors.delete_link(link_id)
         JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
         return jsonify(ok=True)
 
@@ -402,11 +429,34 @@ def create_app(start_monitor: bool = False) -> Flask:
         llm.save_note(code, fc["trade_date"], note)
         return jsonify(note=llm.cached_note(code, fc["trade_date"]))
 
+    @app.post("/api/ai/profile/<code>")
+    def ai_profile(code: str):
+        if not llm.status()["available"]:
+            abort(503, "Local AI not available (start Ollama)")
+        llm.company_profile(code.strip().upper())
+        return jsonify(profile=llm.get_profiles([code.strip().upper()]).get(code.strip().upper()))
+
+    @app.get("/api/ai/portfolio")
+    def ai_portfolio_get():
+        return jsonify(review=db.query_one(
+            "SELECT note, model, created_at FROM ai_notes WHERE code='__PORTFOLIO__' ORDER BY trade_date DESC LIMIT 1"))
+
+    @app.post("/api/ai/portfolio")
+    def ai_portfolio_post():
+        if not llm.status()["available"]:
+            abort(503, "Local AI not available (start Ollama)")
+        try:
+            return jsonify(review=llm.portfolio_review())
+        except ValueError as e:
+            abort(400, str(e))
+
     @app.get("/api/ai/status")
     def ai_status():
         pending = len(llm.pending_news()) if llm.status()["available"] else None
         return jsonify(**llm.status(), pending_news=pending,
-                       scored=db.scalar("SELECT COUNT(*) FROM news WHERE ai_impact IS NOT NULL AND ai_reason <> 'Routine notice'"))
+                       scored=db.scalar("SELECT COUNT(*) FROM news WHERE ai_impact IS NOT NULL AND ai_reason <> 'Routine notice'"),
+                       profiles=db.scalar("SELECT COUNT(*) FROM ai_profiles"),
+                       profiles_pending=len(llm.profile_queue()) if llm.status()["available"] else None)
 
     @app.get("/api/accuracy")
     def accuracy():
@@ -585,6 +635,9 @@ def create_app(start_monitor: bool = False) -> Flask:
                 "simulate", lambda progress=None: {"forecasts": predict.simulate_history(), "checks": predict.run_checks()}))
         if name == "news":
             return jsonify(started=JOBS.start("news", lambda progress=None: news.fetch_latest()))
+        if name == "ai_profiles":
+            return jsonify(started=JOBS.start("ai_profiles", lambda progress=None: llm.profile_batch(max_minutes=180,
+                                                                                                    progress=progress)))
         if name == "ai_news":
             return jsonify(started=JOBS.start("ai_news", lambda progress=None: llm.score_news(days=120, max_minutes=240,
                                                                                               progress=progress)))

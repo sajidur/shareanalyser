@@ -146,6 +146,18 @@ SCHEMA = [
         created_at DATETIME NULL,
         KEY idx_events_date (event_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS political_links (
+        id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        code VARCHAR(32) NOT NULL,
+        person VARCHAR(120) NULL,
+        role VARCHAR(60) NULL,
+        exposure VARCHAR(24) NOT NULL,
+        since DATE NULL,
+        source VARCHAR(300) NOT NULL,
+        note VARCHAR(500) NULL,
+        created_at DATETIME NULL,
+        KEY idx_links_code (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS signal_log (
         id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
         signal_date DATE NOT NULL,
@@ -161,6 +173,13 @@ SCHEMA = [
         return_pct DOUBLE NULL, max_gain_pct DOUBLE NULL, max_loss_pct DOUBLE NULL, sessions INT NULL,
         UNIQUE KEY uq_signal (signal_date, code, signal_type),
         KEY idx_signal_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS ai_profiles (
+        code VARCHAR(32) NOT NULL PRIMARY KEY,
+        as_of DATE NULL,
+        model VARCHAR(64) NULL,
+        data MEDIUMTEXT NULL,
+        created_at DATETIME NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS ai_notes (
         code VARCHAR(32) NOT NULL,
@@ -250,6 +269,9 @@ MIGRATIONS = [
     ("news", "ai_at", "ai_at DATETIME NULL AFTER ai_reason"),
     ("predictions", "low30", "low30 DOUBLE NULL AFTER median"),
     ("predictions", "high30", "high30 DOUBLE NULL AFTER low30"),
+    ("news", "nocf_growth", "nocf_growth DOUBLE NULL AFTER eps_growth"),
+    ("news", "nav_growth", "nav_growth DOUBLE NULL AFTER nocf_growth"),
+    ("news", "mf_nav", "mf_nav DOUBLE NULL AFTER nav_growth"),
 ]
 
 

@@ -328,7 +328,7 @@ function renderStatus(st) {
 function renderBanner(st) {
   const b = $('#banner');
   const jobs = st.jobs || {};
-  const local = ['backfill', 'daily', 'analyze', 'predict', 'simulate', 'ai_news'].map(k => jobs[k]).find(j => j && j.running);
+  const local = ['backfill', 'daily', 'analyze', 'predict', 'simulate', 'ai_news', 'ai_profiles'].map(k => jobs[k]).find(j => j && j.running);
   const external = st.backfill_progress && st.backfill_progress.running ? st.backfill_progress : null;
   if (local || external) {
     const p = local ? local.progress : external;
@@ -339,6 +339,7 @@ function renderBanner(st) {
       : name === 'predict' ? 'Training and testing the prediction model'
       : name === 'simulate' ? 'Rebuilding the walk-forward forecast history (about 2 minutes)'
       : name === 'ai_news' ? 'Local AI is rating announcements (about 7 seconds each)'
+      : name === 'ai_profiles' ? 'Local AI is running company health checks (2–3 minutes each)'
       : 'Re-running analysis';
     b.innerHTML = `<div class="banner info"><div class="msg"><strong>${what}…</strong> ${p ? `${p.done} / ${p.total} <span class="muted">${esc(p.item || '')}</span>` : ''}</div>${pct != null ? `<div class="progress"><div style="width:${pct}%"></div></div>` : ''}</div>`;
     S.jobWasRunning = true;
@@ -1084,6 +1085,29 @@ function planDatesHtml(p) {
   </div>`;
 }
 
+const AREA_LABEL = { governance: 'Governance', financial_health: 'Financial health', growth: 'Growth', dividend_reliability: 'Dividend reliability', news_flow: 'News flow', political_exposure: 'Political / state risk' };
+function aiProfileBody(p, available) {
+  return p ? `<div class="hbars">${Object.keys(AREA_LABEL).map(k => {
+      if (!isNum(p[k])) return `<div class="hbar" style="grid-template-columns:140px minmax(0,1fr) 40px"><span class="n">${AREA_LABEL[k]}</span><span class="small muted">not scored yet: re-check</span><span class="val">—</span></div>`;
+      const v = p[k], w = Math.abs(v) / 2 * 50;
+      const style = v >= 0 ? `left:50%;width:${w}%` : `left:${50 - w}%;width:${w}%`;
+      return `<div class="hbar" style="grid-template-columns:140px minmax(0,1fr) 40px"><span class="n">${AREA_LABEL[k]}</span><div class="track"><div class="axis0"></div><div class="fill ${v >= 0 ? 'pos' : 'neg'}" style="${style}"></div></div><span class="val ${dir(v)}">${v > 0 ? '+' : ''}${v}</span></div>`;
+    }).join('')}</div>
+    <div class="grid g2 mt" style="gap:12px">
+      <div><h3>Positives</h3><ul class="steps" style="padding-left:18px;margin:4px 0">${(p.positives || []).map(x => `<li>${esc(x)}</li>`).join('') || '<li class="muted">none listed</li>'}</ul></div>
+      <div><h3>Risks</h3><ul class="steps" style="padding-left:18px;margin:4px 0">${(p.risks || []).map(x => `<li>${esc(x)}</li>`).join('') || '<li class="muted">none listed</li>'}</ul></div>
+    </div>
+    ${p.political_capped ? `<p class="small muted mt">The model scored political / state risk ${p.political_capped.model_said > 0 ? '+' : ''}${p.political_capped.model_said}; the filings (takeover, write-off or court order) cap it at ${p.political_capped.cap}.</p>` : ''}
+    <p class="mt">${esc(p.summary || '')}</p>
+    <p class="small muted">${esc(p.model || '')} · ${fmtDate(p.as_of)} · scores −2 (serious problems) to +2 (clearly strong), from the company's DSE announcements and financial history</p>`
+    : `<p class="muted small">${available ? 'No health check yet. It runs automatically for your holdings, watchlist and signals; or click "Check now" (about 2–3 minutes).' : 'Local AI not available: start Ollama.'}</p>`;
+}
+function aiProfileHtml(p, code, available) {
+  return `<div class="card"><div class="card-h"><h2>AI company health check</h2><span class="small muted">local LLM reading the filings · not back-tested</span>
+      <button class="btn btn-sm" id="ai-prof" data-code="${esc(code)}" ${available ? '' : 'disabled'}>${p ? 'Re-check' : 'Check now'}</button></div>
+    <div class="card-b" id="ai-prof-out">${aiProfileBody(p, available)}</div></div>`;
+}
+
 function aiCardHtml(one) {
   const ai = one.ai || {};
   const n = one.ai_note;
@@ -1136,7 +1160,8 @@ function rangeForDate(fc, iso) {
 
 function formulaHtml(m) {
   const hz = m.horizons || {};
-  const meth = { baseline: '60-day volatility × √days', vol: 'volatility model', vol_binned: 'volatility model, scaled per volatility bucket' };
+  const meth = { baseline: '60-day volatility × √days', vol: 'volatility model', vol_binned: 'volatility model, scaled per volatility bucket',
+    vol_bd: 'volatility model + Bangladesh/political inputs', vol_bd_binned: 'volatility model + Bangladesh/political inputs, scaled per bucket' };
   const groups = {};
   (m.inputs || []).forEach(x => { (groups[x.group] = groups[x.group] || []).push(x.label); });
   const f = s => `<code style="white-space:normal">${s}</code>`;
@@ -1144,7 +1169,8 @@ function formulaHtml(m) {
     <ol class="steps" style="padding-left:18px">
       <li><b>Expected size of the move (σ̂).</b> A ridge regression predicts how big the move will be, from ${(m.vol_inputs || []).length || 17} volatility inputs (${esc((m.vol_inputs || []).join(', '))}):<br>
         ${f('ln(|ln(P<sub>t+h</sub>/P<sub>t</sub>)| + 0.002) = b₀ + Σ bⱼ·vⱼ   ⇒   σ̂<sub>h</sub> = e<sup>b₀ + Σ bⱼ·vⱼ</sup>')}<br>
-        Range method in use: ${Object.entries(hz).filter(([, v]) => v.available && !v.extrapolated).map(([, v]) => `${esc(v.label)} = ${esc(meth[v.range_method] || v.range_method)}`).join('; ')}. Picked daily by the lowest interval score (width + 2/α × miss) on unseen data.
+        Range method in use: ${Object.entries(hz).filter(([, v]) => v.available && !v.extrapolated).map(([, v]) => `${esc(v.label)} = ${esc(meth[v.range_method] || v.range_method)}`).join('; ')}. Picked daily by the lowest interval score (width + 2/α × miss) on unseen data.<br>
+        Bangladesh/political inputs the range model can add (${esc((m.vol_bd_inputs || []).join(', '))}): effect on the interval score ${Object.entries(hz).filter(([, v]) => v.available && !v.extrapolated && isNum(v.bd_range_gain_pct)).map(([, v]) => `${esc(v.label)} ${v.bd_range_gain_pct > 0 ? '+' : ''}${fmt(v.bd_range_gain_pct, 1)}%`).join(', ') || 'not tested yet'} (negative = better; used only where they win).
         Long term: ${f('σ̂<sub>6m, 1y</sub> = σ̂<sub>3m</sub> × √(h / 60)')} with the 3-month shape (an estimate until enough history exists to test it).</li>
       <li><b>Measured shape of DSE moves.</b> z = ln(P<sub>t+h</sub>/P<sub>t</sub>) / σ̂<sub>h</sub> over all past stock-days; q<sub>p</sub> = p-th percentile of z (fat tails and circuit-limit jumps included).</li>
       <li><b>Price range</b> at confidence c (50%, 68%, 90%):<br>
@@ -1240,6 +1266,7 @@ function stockPredictionHtml(one) {
           <div class="card-b small muted">Inside the ${lvl}% range ${track.filter(inT).length} of ${track.length} times shown (target about ${lvl}%). <a href="#/accuracy">All stocks →</a></div>`;
         })() : '<div class="card-b muted small">Forecasts are saved every trading day. Their outcomes appear here once each horizon has passed.</div>'}</div></div>
     </div>
+    ${aiProfileHtml(one.ai_profile, one.instrument.code, (one.ai || {}).available)}
     ${aiCardHtml(one)}
     <div class="card"><div class="card-h"><h2>News &amp; announcements</h2><span class="small muted">from DSE · used by the model (tone, earnings surprise, dividend, record date, AI score)</span></div>
       <div class="card-b">${newsListHtml(one.news, one.tag_labels)}</div></div>`;
@@ -1440,6 +1467,20 @@ async function viewPredict(el, args, ctx) {
   }));
   const sc = $('#sig-card');
   if (sc) sc.addEventListener('click', e => { const tr = e.target.closest('tr[data-code]'); if (tr) location.hash = '#/predict/' + encodeURIComponent(tr.dataset.code); });
+  const profBtn = $('#ai-prof');
+  if (profBtn && one) profBtn.addEventListener('click', async () => {
+    profBtn.disabled = true;
+    profBtn.textContent = 'Checking…';
+    $('#ai-prof-out').innerHTML = '<p class="muted small">The local model is reading the filings (about 2–3 minutes)…</p>';
+    try {
+      const r = await api('/ai/profile/' + encodeURIComponent(one.instrument.code), { method: 'POST' });
+      $('#ai-prof-out').innerHTML = aiProfileBody(r.profile, true);
+      profBtn.textContent = 'Re-check';
+    } catch (err) {
+      $('#ai-prof-out').innerHTML = `<p class="down small">${esc(err.message)}</p>`;
+      profBtn.textContent = 'Check now';
+    } finally { profBtn.disabled = false; }
+  });
   const gen = $('#ai-gen');
   if (gen && one) gen.addEventListener('click', async () => {
     gen.disabled = true;
@@ -1610,7 +1651,72 @@ async function viewAccuracy(el, args, ctx) {
 const REGIME_CLASS = { Calm: 'b', Euphoric: '', Nervous: 'be', Stress: 'sbe' };
 const evBadge = e => `<span class="label ${e === 'strong' ? 'sbe' : e === 'moderate' ? 'be' : ''}">${esc(e || 'n/a')}</span>`;
 const BD_KIND_LABEL = { dse_query: 'DSE query', rumour: 'Rumour clarification', sponsor_buy: 'Sponsor buy', sponsor_sell: 'Sponsor sell',
-  to_z: 'To Z', from_z: 'From Z', margin_ban: 'Margin ban', regulator: 'Regulator', govt: 'Government/state' };
+  to_z: 'To Z', from_z: 'From Z', margin_ban: 'Margin ban', regulator: 'Regulator', govt: 'Government/state',
+  state_control: 'State / regulator control', political_hit: 'Political disruption', court_hold: 'Court order' };
+const BD_NEG_KINDS = ['to_z', 'margin_ban', 'rumour', 'sponsor_sell', 'state_control', 'political_hit'];
+
+function groupRow(g) {
+  const a = g.all || {}, u = g.uneasy || {};
+  return `<tr><td class="wrap">${esc(g.label)}${g.hindsight ? ' <span class="chip warn" title="The group was chosen knowing what happened, so its past result looks more certain than it is">hindsight</span>' : ''}</td>
+    <td class="r">${fmtInt(g.companies)}</td><td class="r">${chg(a.ex20, 1)}</td><td class="r">${isNum(a.pos20) ? fmt(a.pos20, 0) + '%' : '—'}</td>
+    <td class="r">${chg(u.ex20, 1)}</td><td class="r">${isNum(u.pos20) ? fmt(u.pos20, 0) + '%' : '—'}</td></tr>`;
+}
+
+function politicalCardHtml(d) {
+  const p = d.political || {};
+  const groups = Object.values(p.groups || {});
+  const links = d.links || [];
+  const exp = d.exposures || {};
+  const evs = d.political_events || [];
+  return `<div class="card"><div class="card-h"><h2>Political &amp; state influence</h2><span class="small muted">from DSE filings, shareholding and prices · plus your own records</span></div>
+    <div class="card-b">
+      <h3>How these groups of shares did</h3>
+      <div class="table-wrap"><table class="t"><thead><tr><th>Group</th><th class="r">Companies</th><th class="r">Next 20 sessions vs market</th><th class="r">Beat market</th><th class="r">… when the market was Nervous/Stress</th><th class="r">Beat</th></tr></thead>
+        <tbody>${groups.map(groupRow).join('') || `<tr><td colspan="6">${empty('Not measured yet')}</td></tr>`}</tbody></table></div>
+      <p class="small muted">Median result of every 5th session, share vs the equal-weight market. "Fell hardest on sell-off days" uses the whole year to pick the shares, so it is marked hindsight; the predictor uses a point-in-time version of it.
+        Sell-off day = market down ${fmt(Math.abs(p.shock_day_pct || 1), 0)}% or more (${fmtInt(p.shock_days)} days so far).</p>
+    </div>
+    <div class="grid g2" style="gap:0">
+      <div class="card-b"><h3>Fall hardest on sell-off days</h3><div class="table-wrap" id="shock-t"></div>
+        <p class="small muted">1.0× = falls like the market; 2.0× = twice as much. Shares with at least 10 sell-off days.</p></div>
+      <div class="card-b"><h3>State-owned / state-backed shares</h3><div class="table-wrap tall" id="govt-t"></div></div>
+    </div>
+    <div class="card-b"><h3>Takeovers, court orders and political disruption in filings (last year)</h3>
+      ${evs.length ? `<ul class="list-plain small" style="max-height:340px;overflow:auto">${evs.map(e => `<li class="sp"><span>${stockLink(e.code)} <span class="muted">${esc(e.name || '')}</span></span><span><span class="chip ${BD_NEG_KINDS.includes(e.type) ? 'neg' : 'warn'}">${esc(BD_KIND_LABEL[e.type] || e.type)}</span> ${fmtDate(e.date)}</span></li>`).join('')}</ul>` : '<p class="muted small">None found.</p>'}
+    </div>
+    <div class="card-b"><h3>Your records: political exposure of owners and sponsors</h3>
+      <p class="small muted">Record links you know from news you trust (for example a sponsor linked to the former government, or owners under investigation), always with a source. Records are measured as a group above, and "former government" or "under investigation" records keep the share out of ACCUMULATE. They stay on this PC.</p>
+      <div class="table-wrap"><table class="t"><thead><tr><th>Code</th><th>Exposure</th><th>Person / role</th><th>Since</th><th>Source</th><th></th></tr></thead><tbody>
+        ${links.map(l => `<tr><td>${stockLink(l.code)}</td><td class="wrap">${esc(l.exposure_label)}</td><td class="wrap">${esc(l.person || '—')}${l.role ? ` <span class="muted">· ${esc(l.role)}</span>` : ''}</td><td>${l.since ? fmtDate(l.since) : '—'}</td><td class="wrap small">${/^https?:\/\//.test(l.source) ? `<a href="${esc(l.source)}" target="_blank" rel="noopener noreferrer">${esc(l.source.slice(0, 60))}</a>` : esc(l.source)}${l.note ? `<div class="muted">${esc(l.note)}</div>` : ''}</td><td><button class="x-btn" data-del-link="${l.id}" title="Delete" aria-label="Delete record">✕</button></td></tr>`).join('') || `<tr><td colspan="6">${empty('No records yet')}</td></tr>`}
+      </tbody></table></div>
+      <form class="modal-b mt" id="link-form" novalidate>
+        <div class="row"><label class="field"><span>Trading code</span><input name="code" required placeholder="e.g. BEXIMCO" style="text-transform:uppercase"></label>
+          <label class="field"><span>Exposure</span><select name="exposure" required>${Object.entries(exp).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label></div>
+        <div class="row"><label class="field"><span>Person (optional)</span><input name="person" maxlength="120"></label>
+          <label class="field"><span>Role (optional)</span><input name="role" maxlength="60" placeholder="sponsor, chairman, director"></label>
+          <label class="field"><span>Since (optional)</span><input type="date" name="since"></label></div>
+        <div class="row"><label class="field"><span>Source (required)</span><input name="source" maxlength="300" required placeholder="newspaper + date, or a link"></label>
+          <label class="field"><span>Note</span><input name="note" maxlength="500"></label></div>
+        <div class="sp"><div class="form-err" id="link-err"></div><button class="btn btn-primary">Add record</button></div>
+      </form>
+    </div></div>`;
+}
+
+function politicalStockHtml(p) {
+  if (!p) return '';
+  const sh = p.shock, base = p.baseline || {};
+  const ev = p.events || [];
+  return `<h3 class="mt">Political &amp; state influence</h3>
+    <div class="plan-grid">
+      <div class="cell"><div class="k">Government shareholding</div><div class="v">${isNum(p.govt_hold) ? fmt(p.govt_hold, 1) + '%' : 'none'}</div><div class="d">from the DSE shareholding report</div></div>
+      <div class="cell"><div class="k">Fall on sell-off days</div><div class="v ${sh && sh.beta >= 1.5 ? 'down' : ''}">${sh ? fmt(sh.beta, 2) + '× market' : '—'}</div><div class="d">${sh ? `on ${sh.days} days the market fell ${fmt(Math.abs(p.shock_day_pct || 1), 0)}%+ (political / macro shocks); higher than ${fmt(sh.pct_rank, 0)}% of shares` : 'not enough trading history'}</div></div>
+      <div class="cell"><div class="k">Your political records</div><div class="v">${(p.links || []).length || 'none'}</div><div class="d">${(p.links || []).map(l => esc(l.exposure_label) + (l.person ? ` (${esc(l.person)})` : '')).join(' · ') || '<a href="#/bd">add one on the BD factors page</a>'}</div></div>
+    </div>
+    ${(p.groups || []).length ? `<div class="table-wrap mt"><table class="t"><thead><tr><th>Group this share is in</th><th class="r">Companies</th><th class="r">Next 20 vs market</th><th class="r">Beat market</th><th class="r">… in Nervous/Stress</th><th class="r">Beat</th></tr></thead><tbody>
+      ${p.groups.map(groupRow).join('')}${base.all ? groupRow({ label: 'All shares (for comparison)', companies: base.companies, all: base.all, uneasy: base.uneasy }) : ''}</tbody></table></div>` : ''}
+    ${ev.length ? `<div class="small muted mt">In this company's filings in the last 12 months:</div><ul class="list-plain small">${ev.map(e => `<li class="sp"><span><b>${fmtDate(e.date)}</b> · ${esc(e.label)}</span><span>${isNum(e.ex20) ? `typically ${fmtPct(e.ex20, 1)} vs market over 20 sessions (n=${e.n})` : ''} ${evBadge(e.evidence)}</span></li>`).join('')}</ul>`
+      : '<p class="small muted mt">No central bank / regulator takeover, court order or political disruption in this company\'s filings in the last year.</p>'}`;
+}
 
 function bdStockCardHtml(one) {
   const b = one.bd || {};
@@ -1625,8 +1731,9 @@ function bdStockCardHtml(one) {
       <div class="cell"><div class="k">Pump-and-dump risk</div><div class="v ${spec && spec.score >= 60 ? 'down' : ''}">${spec ? `${spec.score}/100` : '—'}</div><div class="d">${spec && spec.why.length ? esc(spec.why.join(' · ')) : 'no speculative pattern'}</div></div>
       <div class="cell"><div class="k">High-risk shares historically</div><div class="v">${isNum(sb.ex20) ? fmtPct(sb.ex20, 1) : '—'}</div><div class="d">typical 20-session result vs market; 1 in 10 fell ${isNum(sb.p10) ? fmt(Math.abs(sb.p10), 0) : '—'}%+, 1 in 10 gained ${isNum(sb.p90) ? fmt(sb.p90, 0) : '—'}%+</div></div>
     </div>
-    <h3 class="mt">Recent Bangladesh-specific events for this share (last 45 days)</h3>
-    ${events.length ? `<ul class="list-plain small">${events.map(e => `<li class="sp"><span><b>${fmtDate(e.date, { day: 'numeric', month: 'short' })}</b> · ${esc(e.label)}</span><span>${isNum(e.ex20) ? `typically ${fmtPct(e.ex20, 1)} vs market over 20 sessions (n=${e.n})` : ''} ${evBadge(e.evidence)}</span></li>`).join('')}</ul>` : '<p class="muted small">None: no DSE query, rumour clarification, insider declaration, category change, margin ban or regulator/government news recently.</p>'}
+    <h3 class="mt">Recent Bangladesh-specific events for this share</h3>
+    ${events.length ? `<ul class="list-plain small">${events.map(e => `<li class="sp"><span><b>${fmtDate(e.date, { day: 'numeric', month: 'short' })}</b> · ${esc(e.label)}</span><span>${isNum(e.ex20) ? `typically ${fmtPct(e.ex20, 1)} vs market over 20 sessions (n=${e.n})` : ''} ${evBadge(e.evidence)}</span></li>`).join('')}</ul>` : '<p class="muted small">None: no DSE query, rumour clarification, insider declaration, category change, margin ban or regulator/government news recently (political events count for up to 6 months).</p>'}
+    ${politicalStockHtml(b.political)}
   </div></div>`;
 }
 
@@ -1644,7 +1751,7 @@ async function viewBD(el, args, ctx) {
   ctx.render(`
     <div class="page-h"><div><h1>Bangladesh factors</h1>
       <div class="sub">Measured on DSE prices ${fmtDate(d.history_from)} – ${fmtDate(d.history_to)} · rebuilt every trading day after the close · updated ${fmtTime(d.built_at)}</div></div></div>
-    <div class="note">Political power cannot be measured directly from any data. This page measures its <b>footprint</b>: market-wide stress, regulator and government involvement in company news, and how shares behaved after rumours, insider deals and category changes. Only effects with real evidence change the buy/sell signals. No company is labelled as politically connected.</div>
+    <div class="note">Political power cannot be measured directly from any data. This page measures its <b>footprint</b>: market-wide stress, central bank / regulator takeovers, court orders, companies reporting political disruption, government shareholding, how hard each share falls on sell-off days, and how shares behaved after rumours, insider deals and category changes. Only effects with real evidence change the buy/sell signals. The tool never guesses anyone's political affiliation; you can record links you know about (with a source) and they are measured below.</div>
     <div class="grid g-main">
       <div class="card"><div class="card-h"><h2>Market regime</h2><span class="label ${REGIME_CLASS[reg.regime] || ''}">${esc(reg.regime || '—')}</span><span class="small muted">equal-weight market of all shares</span></div>
         <div class="chart-box dash" id="bd-reg"></div>
@@ -1665,6 +1772,7 @@ async function viewBD(el, args, ctx) {
         ${studies.map(([k, s]) => `<tr><td>${esc(s.label)}</td><td class="r">${fmtInt(s.n)}</td><td class="r">${chg(s.pre20, 1)}</td><td class="r">${chg(s.ex1, 1)}</td><td class="r">${chg(s.ex5, 1)}</td><td class="r" title="Trimmed mean ${fmtPct(s.wmean20, 1)} · raw mean ${fmtPct(s.mean20, 1)}">${chg(s.ex20, 1)}</td><td class="r">${isNum(s.pos20) ? fmt(s.pos20, 0) + '%' : '—'}</td><td>${evBadge(s.evidence)}</td><td class="small">${used(s) ? (k === 'record_date' ? 'Wait until after the record date' : 'Avoid new buys; holders: sell if strong') : '<span class="muted">no</span>'}</td></tr>`).join('')}
       </tbody></table></div>
       <div class="card-b small muted">"Evidence" needs the median and the outlier-trimmed mean to agree, a typical move of at least 1%, and a t-statistic ≥ 1.5 (moderate) or ≥ 2.5 (strong). Circuit days and DSE queries show huge <i>average</i> moves caused by a few shares that multiplied; the typical share did not, so they are not used as buy signals.</div></div>
+    ${politicalCardHtml(d)}
     <div class="grid g2">
       <div class="card"><div class="card-h"><h2>Political &amp; regulatory events</h2><span class="small muted">market reaction (equal-weight)</span></div>
         <div class="table-wrap"><table class="t"><thead><tr><th>Date</th><th>Event</th><th class="r">5 days before</th><th class="r">Next day</th><th class="r">Next 5</th><th class="r">Next 20</th><th></th></tr></thead><tbody>
@@ -1690,7 +1798,7 @@ async function viewBD(el, args, ctx) {
       </div></div>
     </div>
     <div class="card"><div class="card-h"><h2>Rumours, insider deals &amp; regulator news (last 30 days)</h2></div><div class="card-b">
-      ${(d.recent_flagged || []).length ? `<ul class="list-plain">${d.recent_flagged.map(n => `<li><div class="sp" style="align-items:flex-start"><span>${stockLink(n.code)} <b>${esc(n.summary)}</b> <span class="small muted">${fmtDate(n.news_date, { day: 'numeric', month: 'short' })}</span></span><span class="chips">${n.kinds.map(k => `<span class="chip ${['to_z', 'margin_ban', 'rumour', 'sponsor_sell'].includes(k) ? 'neg' : k === 'sponsor_buy' || k === 'from_z' ? 'pos' : 'warn'}">${esc(BD_KIND_LABEL[k] || k)}</span>`).join('')}</span></div><div class="small muted">${esc((n.body || '').slice(0, 220))}</div></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
+      ${(d.recent_flagged || []).length ? `<ul class="list-plain">${d.recent_flagged.map(n => `<li><div class="sp" style="align-items:flex-start"><span>${stockLink(n.code)} <b>${esc(n.summary)}</b> <span class="small muted">${fmtDate(n.news_date, { day: 'numeric', month: 'short' })}</span></span><span class="chips">${n.kinds.map(k => `<span class="chip ${BD_NEG_KINDS.includes(k) ? 'neg' : k === 'sponsor_buy' || k === 'from_z' ? 'pos' : 'warn'}">${esc(BD_KIND_LABEL[k] || k)}</span>`).join('')}</span></div><div class="small muted">${esc((n.body || '').slice(0, 220))}</div></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
     </div></div>`);
   mountTable($('#spec-t'), [
     { key: 'code', label: 'Code', html: r => `<span class="code">${esc(r.code)}</span><span class="nm">${esc(r.name || '')}</span>` },
@@ -1698,6 +1806,26 @@ async function viewBD(el, args, ctx) {
     { key: 'r20', label: '1 month', align: 'r', html: r => chg(r.r20, 1) },
     { key: 'why', label: 'Why', cls: 'wrap', html: r => `<span class="small">${esc(r.why.join(' · '))}</span>` },
   ], d.spec_top || [], { sort: 'score', dir: -1 }, { empty: 'No high-risk shares today' });
+  mountTable($('#shock-t'), [
+    { key: 'code', label: 'Code', html: r => `<span class="code">${esc(r.code)}</span><span class="nm">${esc(r.name || '')}</span>` },
+    { key: 'beta', label: 'Fall vs market', align: 'r', html: r => `<b class="${r.beta >= 1.5 ? 'down' : ''}">${fmt(r.beta, 2)}×</b>` },
+    { key: 'avg', label: 'Avg on those days', align: 'r', html: r => chg(r.avg, 1) },
+    { key: 'days', label: 'Days', align: 'r', html: r => fmtInt(r.days) },
+  ], d.shock_top || [], { sort: 'beta', dir: -1 }, { empty: 'Not enough history' });
+  mountTable($('#govt-t'), [
+    { key: 'code', label: 'Code', html: r => `<span class="code">${esc(r.code)}</span><span class="nm">${esc(r.name || '')}</span>` },
+    { key: 'govt_hold', label: 'Government', align: 'r', html: r => fmt(r.govt_hold, 1) + '%' },
+    { key: 'beta', label: 'Fall on sell-offs', align: 'r', html: r => isNum(r.beta) ? fmt(r.beta, 2) + '×' : '—' },
+  ], d.govt_top || [], { sort: 'govt_hold', dir: -1 }, { empty: 'No state-owned shares found' });
+  const lf = $('#link-form');
+  if (lf) lf.addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+      await api('/bd/links', { method: 'POST', body: Object.fromEntries(new FormData(lf).entries()) });
+      toast('Recorded; group results are being re-measured');
+      setTimeout(rerender, 3000);
+    } catch (err) { $('#link-err').textContent = err.message; }
+  });
   const f = $('#ev-form');
   f.addEventListener('submit', async e => {
     e.preventDefault();
@@ -1766,14 +1894,14 @@ async function viewWatchlist(el, args, ctx) {
 
 /* ---------------- portfolio */
 async function viewPortfolio(el, args, ctx) {
-  const [d, pl] = await Promise.all([api('/portfolio'), api('/plans').catch(() => null)]);
+  const [d, pl, rv] = await Promise.all([api('/portfolio'), api('/plans').catch(() => null), api('/ai/portfolio').catch(() => ({}))]);
   if (!ctx.alive()) return;
   S.commissionRate = d.commission_rate;
   const s = d.summary, t = s.totals;
   const planOf = Object.fromEntries(((pl && pl.holdings) || []).map(p => [p.code, p]));
   const hcols = [
     COL.code,
-    { key: 'action', label: 'Action', html: r => { const p = planOf[r.code]; return p ? `${sigBadge(p.signal)}<div class="small muted" style="max-width:220px;white-space:normal">${esc(p.reasons[0] || '')}</div>` : '—'; } },
+    { key: 'action', label: 'Action', html: r => { const p = planOf[r.code]; return p ? `<div title="${esc((p.reasons || []).join('\n'))}">${sigBadge(p.signal)}<div class="small muted" style="width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc((p.reasons || [])[0] || '')}</div></div>` : '—'; } },
     { key: 'trail', label: 'Trailing stop', align: 'r', html: r => { const p = planOf[r.code]; return p && p.holding ? `<span class="down">${fmt(p.holding.trailing_stop)}</span>` : '—'; } },
     { key: 'qty', label: 'Shares', align: 'r', html: r => fmtInt(r.qty) },
     { key: 'avg_cost', label: 'Avg cost', align: 'r', html: r => fmt(r.avg_cost) },
@@ -1813,7 +1941,21 @@ async function viewPortfolio(el, args, ctx) {
         ${s.sectors.length ? `<div class="hbars">${s.sectors.map(x => `<div class="hbar"><span class="n">${esc(x.sector)}</span><div class="track"><div class="fill mag" style="width:${(x.pct / maxSec) * 100}%"></div></div><span class="val">${fmt(x.pct, 1)}%</span></div>`).join('')}</div>` : '<p class="muted small">No holdings.</p>'}
       </div></div>
     </div>
+    ${s.holdings.length ? `<div class="card"><div class="card-h"><h2>AI portfolio review</h2><span class="small muted">local LLM, from your holdings, the tool's signals and health checks</span><button class="btn btn-sm" id="ai-review">${rv && rv.review ? 'Review again' : 'Review my portfolio'}</button></div>
+      <div class="card-b ai-note" id="ai-review-out">${rv && rv.review ? mdLite(rv.review.note) + `<p class="small muted">${esc(rv.review.model || '')} · ${fmtTime(rv.review.created_at)}</p>` : '<p class="muted small">Click to get a plain-language review (about 3–5 minutes on your PC).</p>'}</div></div>` : ''}
     <div class="card"><div class="card-h"><h2>Transactions</h2><span class="small muted">${d.transactions.length} recorded</span></div><div class="table-wrap tall" id="p-tx"></div></div>`);
+  const rb = $('#ai-review');
+  if (rb) rb.addEventListener('click', async () => {
+    rb.disabled = true;
+    rb.textContent = 'Reviewing…';
+    $('#ai-review-out').innerHTML = '<p class="muted small">The local model is reviewing your portfolio (3–5 minutes, keep this page open)…</p>';
+    try {
+      const r = await api('/ai/portfolio', { method: 'POST' });
+      $('#ai-review-out').innerHTML = mdLite(r.review.note) + `<p class="small muted">${esc(r.review.model || '')} · ${fmtTime(r.review.created_at)}</p>`;
+      rb.textContent = 'Review again';
+    } catch (err) { $('#ai-review-out').innerHTML = `<p class="down small">${esc(err.message)}</p>`; rb.textContent = 'Review my portfolio'; }
+    finally { rb.disabled = false; }
+  });
   mountTable($('#p-hold'), hcols, s.holdings, { sort: 'market_value', dir: -1 }, { empty: 'No open positions — add a BUY transaction' });
   mountTable($('#p-tx'), tcols, d.transactions.map(r => ({ ...r, code_: r.code })), { sort: 'trade_date', dir: -1 }, { noNav: true, empty: 'No transactions yet' });
   $('#p-add').addEventListener('click', () => openTxModal());
@@ -1897,6 +2039,7 @@ async function viewReport(el, date, ctx) {
       <div class="tile"><div class="k">Turnover</div><div class="v">Tk ${crore(m.turnover_mn)}</div><div class="d">${isNum(m.turnover_change_pct) ? chg(m.turnover_change_pct, 1) + ' vs previous' : '&nbsp;'}</div></div>
       <div class="tile"><div class="k">Breadth</div><div class="v" style="font-size:18px"><span class="up">▲${m.advanced ?? '—'}</span> <span class="down">▼${m.declined ?? '—'}</span> <span class="flat">=${m.unchanged ?? '—'}</span></div><div class="d">${m.traded} instruments traded</div></div>
     </div>
+    ${r.ai_brief ? `<div class="card"><div class="card-h"><h2>AI market brief</h2><span class="small muted">local LLM, written only from the figures below</span></div><div class="card-b ai-note">${mdLite(r.ai_brief)}</div></div>` : ''}
     ${pf.positions ? `<div class="card"><div class="card-h"><h2>Your portfolio</h2></div><div class="card-b"><div class="kv">
       <div><span>Market value</span><span>${tk(pf.market_value, 0)}</span></div><div><span>Today</span><span>${tkSigned(pf.day_change)} (${chg(pf.day_change_pct)})</span></div>
       <div><span>Unrealised P/L</span><span>${tkSigned(pf.unrealized)} (${chg(pf.unrealized_pct)})</span></div><div><span>Realised P/L</span><span>${tkSigned(pf.realized)}</span></div></div></div></div>` : ''}
@@ -1985,6 +2128,7 @@ async function viewSettings(el, args, ctx) {
           <label class="field"><span>Max in one share (% of capital)</span><input type="number" step="1" min="1" name="max_position_pct" value="${esc(s.max_position_pct)}"></label>
           <label class="field"><span>AI news scoring per day (minutes)</span><input type="number" step="1" min="0" name="ai_daily_minutes" value="${esc(s.ai_daily_minutes)}"></label>
         </div>
+        <label class="field"><span>AI company health checks per day (minutes)</span><input type="number" step="1" min="0" name="ai_profile_minutes" value="${esc(s.ai_profile_minutes)}"></label>
         <h3>Notifications</h3>
         <label class="check"><input type="checkbox" name="notify_toast" ${s.notify_toast === '1' ? 'checked' : ''}> Windows desktop notifications</label>
         <label class="check"><input type="checkbox" name="notify_telegram" ${s.notify_telegram === '1' ? 'checked' : ''}> Telegram messages (to your phone)</label>
@@ -2001,9 +2145,13 @@ async function viewSettings(el, args, ctx) {
             <div><span>Server · model</span><span>${esc(ai.host || '')} · ${esc(ai.model || '')}</span></div>
             <div><span>Announcements rated by AI</span><span>${fmtInt(ai.scored)}</span></div>
             <div><span>Waiting to be rated (last 120 days)</span><span>${isNum(ai.pending_news) ? fmtInt(ai.pending_news) : '—'}</span></div>
+            <div><span>Analysis model (health checks, briefs, reviews)</span><span>${esc(ai.analysis_model || '')}</span></div>
+            <div><span>Company health checks done · due</span><span>${fmtInt(ai.profiles)} · ${isNum(ai.profiles_pending) ? fmtInt(ai.profiles_pending) : '—'}</span></div>
           </div>
           <p class="muted">Used to rate each non-routine announcement (−2 … +2, fed to the model as "AI news score") and to write analyst notes. Runs on this PC; nothing is sent online. Change the model in <code>config.ini</code> [ollama].</p>
-          <div class="toolbar"><button class="btn" data-job="ai_news" ${ai.available ? '' : 'disabled'}>Rate pending news now</button></div>
+          <div class="toolbar"><button class="btn" data-job="ai_news" ${ai.available ? '' : 'disabled'}>Rate pending news now</button>
+            <button class="btn" data-job="ai_profiles" ${ai.available ? '' : 'disabled'}>Run health checks now</button></div>
+          <p class="muted">On this PC the model runs on the processor (no graphics card), about 2–3 minutes per health check and 3–5 minutes for a portfolio review. The daily run spends up to the minutes set in Preferences, holdings and watchlist first.</p>
         </div></div>
         <div class="card"><div class="card-h"><h2>Recent jobs</h2></div><div class="table-wrap" id="runs"></div></div>
       </div>
@@ -2063,6 +2211,13 @@ document.addEventListener('click', async e => {
   if (dal) {
     if (!confirm('Delete this alert?')) return;
     try { await api('/alerts/' + dal.dataset.delAlert, { method: 'DELETE' }); toast('Alert deleted'); rerender(); }
+    catch (err) { toast(err.message, 'err'); }
+    return;
+  }
+  const dlk = e.target.closest('[data-del-link]');
+  if (dlk) {
+    if (!confirm('Delete this political exposure record?')) return;
+    try { await api('/bd/links/' + dlk.dataset.delLink, { method: 'DELETE' }); toast('Record deleted'); setTimeout(rerender, 2500); }
     catch (err) { toast(err.message, 'err'); }
     return;
   }
