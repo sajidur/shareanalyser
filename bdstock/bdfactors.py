@@ -60,21 +60,50 @@ EVENT_TYPES: dict[str, tuple[str, str, int]] = {
     "wipeout": ("Declared non-viable / shareholders' capital written off",
                 r"reduced to zero|reduction of (?:the )?entire paid-up capital|non-viable|okarjokar", 3650),
 }
+_COMPILED = {k: re.compile(v[1]) for k, v in EVENT_TYPES.items()}
+LONG_TEXT = ("political_hit", "wipeout")   # searched in the first 3000 characters, the rest in 800
 # political events stay relevant longer than a rumour: days an event counts as "active"
 ACTIVE_DAYS = {"state_control": 180, "political_hit": 120, "court_hold": 90, "wipeout": 3650}
 POLITICAL_KINDS = tuple(ACTIVE_DAYS)
 SHOCK_DAY = -0.01   # equal-weight market down 1% or more in a session: a sell-off day
 
-# political exposure the user records (from news they trust); never guessed by the tool
-EXPOSURES = {
-    "former_govt": "Owner / sponsor linked to the former government",
-    "ruling": "Owner / sponsor linked to the current government",
-    "opposition": "Owner / sponsor linked to an opposition party",
+# ---- political links of owners / sponsors / directors: recorded by the USER (with a source), never
+# guessed by the tool. The link's meaning changes with who is in power: a party's link is "ruling"
+# while that party governs, "ousted" for 5 years after it loses power, otherwise "opposition".
+PARTIES = {
+    "awami_league": "Bangladesh Awami League",
+    "bnp": "BNP (Bangladesh Nationalist Party)",
+    "jamaat": "Jamaat-e-Islami",
+    "jatiya_party": "Jatiya Party",
+    "ncp": "National Citizen Party (NCP)",
+    "other": "Other party",
+}
+ROLES = {
+    "minister": "Minister / state minister / adviser",
+    "mp": "Member of Parliament (MP)",
+    "leader": "Party leader / office holder",
+    "relative": "Close relative of an MP, minister or leader",
+    "associate": "Business partner / close associate",
+    "financier": "Donor / financier of the party",
+}
+ALIGNMENTS = {
+    "ruling": "Linked to the party in government",
+    "ousted": "Linked to a party that lost power (last 5 years)",
+    "opposition": "Linked to a party out of power",
+    "under_action": "Owners under investigation, asset freeze, arrest or travel ban",
     "state_appointed": "Board appointed or controlled by the state / regulator",
-    "under_action": "Owners face investigation, asset freeze, arrest or travel ban",
     "other": "Other political exposure",
 }
-RISKY_EXPOSURES = ("former_govt", "under_action")
+SITUATIONS = ("under_action", "state_appointed", "other")   # records without a party
+RISKY_ALIGN = ("ousted", "under_action")
+ALIGN_PRIORITY = ("under_action", "ousted", "ruling", "opposition", "state_appointed", "other")
+OUSTED_YEARS = 5
+# who governed when (editable on the BD factors page; check the last period)
+DEFAULT_TIMELINE = [
+    {"party": "awami_league", "from": "2009-01-06", "to": "2024-08-05", "label": "Awami League government"},
+    {"party": "", "from": "2024-08-08", "to": "2026-02-16", "label": "Interim government (no party)"},
+    {"party": "bnp", "from": "2026-02-17", "to": "", "label": "BNP government (after the 12 Feb 2026 election)"},
+]
 PRICE_EVENTS = {
     "upper_circuit": "Upper circuit day (+9.5% or more)",
     "lower_circuit": "Lower circuit day (−9.5% or less)",
@@ -93,9 +122,11 @@ def active_days(kind: str, default: int = 28) -> int:
 
 
 def classify_news(summary: str, body: str) -> list[str]:
-    # long bodies: results announcements explain deviations (e.g. political unrest) near the end
-    text = f"{summary} {body[:3000]}".lower()
-    found = [k for k, (_, rx, _) in EVENT_TYPES.items() if re.search(rx, text)]
+    text = f"{summary} {body[:800]}".lower()
+    found = [k for k, rx in _COMPILED.items() if k not in LONG_TEXT and rx.search(text)]
+    # results announcements explain deviations (e.g. political unrest) near the end of long bodies
+    long_text = f"{summary} {body[:3000]}".lower() if len(body) > 800 else text
+    found += [k for k in LONG_TEXT if _COMPILED[k].search(long_text)]
     if "sponsor_buy" in found and "sponsor_sell" in found:  # 'buy declaration ... sell' edge cases
         found.remove("sponsor_sell" if "buy declaration" in text else "sponsor_buy")
     if "to_z" in found and "from_z" in found:  # "placed in 'A' category from existing 'Z'" also matches neither twice
@@ -103,12 +134,34 @@ def classify_news(summary: str, body: str) -> list[str]:
     return found
 
 
+def _patterns_version() -> str:
+    import hashlib
+
+    return hashlib.sha1(json.dumps([EVENT_TYPES, LONG_TEXT], sort_keys=True).encode()).hexdigest()[:16]
+
+
+def ensure_classified() -> int:
+    """Store each announcement's event types in news.bd_kinds (classified once; all again only when
+    the patterns change). Returns how many rows were classified."""
+    version = _patterns_version()
+    where = "" if db.get_state("bd_kinds_version") != version else " WHERE bd_kinds IS NULL"
+    rows = db.query(f"SELECT uid, summary, LEFT(body, 3000) AS body FROM news{where}")
+    if rows:
+        db.executemany("UPDATE news SET bd_kinds=%s WHERE uid=%s",
+                       [(",".join(classify_news(r["summary"] or "", r["body"] or "")), r["uid"]) for r in rows])
+    db.set_state("bd_kinds_version", version)
+    return len(rows)
+
+
 def load_news_events() -> dict[str, list[tuple[date, str]]]:
     """code -> [(date, event_type)] sorted, de-duplicated per type within its window."""
+    ensure_classified()
     raw: dict[str, list[tuple[date, str]]] = defaultdict(list)
-    for r in db.query("SELECT code, news_date, summary, LEFT(body, 3000) AS body FROM news ORDER BY code, news_date"):
-        for t in classify_news(r["summary"] or "", r["body"] or ""):
-            raw[r["code"]].append((r["news_date"], t))
+    for r in db.query("SELECT code, news_date, bd_kinds FROM news WHERE bd_kinds IS NOT NULL AND bd_kinds <> '' "
+                      "ORDER BY code, news_date"):
+        for t in r["bd_kinds"].split(","):
+            if t in EVENT_TYPES:
+                raw[r["code"]].append((r["news_date"], t))
     out: dict[str, list[tuple[date, str]]] = {}
     for code, evs in raw.items():
         last: dict[str, date] = {}
@@ -342,35 +395,127 @@ def _group_stats(codes: list[str], panel: dict, market: dict, uneasy: set[int]) 
     return {"companies": n, "all": summ(all_ex), "uneasy": summ(bad_ex)}
 
 
+# ---- government timeline and political alignment
+
+def _d(s: Any) -> date | None:
+    if not s:
+        return None
+    if isinstance(s, date):
+        return s
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except ValueError:
+        return None
+
+
+def timeline() -> list[dict]:
+    return db.get_state("govt_timeline") or [dict(p) for p in DEFAULT_TIMELINE]
+
+
+def save_timeline(periods: list[dict]) -> list[dict]:
+    clean = []
+    for p in periods or []:
+        party = str(p.get("party") or "")
+        if party and party not in PARTIES:
+            raise ValueError(f"Unknown party: {party}")
+        start, end = _d(p.get("from")), _d(p.get("to"))
+        if not start:
+            raise ValueError("Each period needs a start date")
+        if end and end < start:
+            raise ValueError("A period ends before it starts")
+        label = str(p.get("label") or "").strip()[:80] or (PARTIES[party] + " government" if party else "Non-party government")
+        clean.append({"party": party, "from": start.isoformat(), "to": end.isoformat() if end else "", "label": label})
+    clean.sort(key=lambda p: p["from"])
+    db.set_state("govt_timeline", clean)
+    return clean
+
+
+def ruling_party(d: date, tl: list[dict] | None = None) -> str | None:
+    for p in tl if tl is not None else timeline():
+        if _d(p["from"]) <= d and (not p.get("to") or d <= _d(p["to"])):
+            return p.get("party") or None
+    return None
+
+
+def party_alignment(party: str, d: date, tl: list[dict] | None = None) -> str:
+    tl = tl if tl is not None else timeline()
+    if ruling_party(d, tl) == party:
+        return "ruling"
+    lost = [_d(p["to"]) for p in tl if p.get("party") == party and p.get("to") and _d(p["to"]) < d]
+    if lost and (d - max(lost)).days <= OUSTED_YEARS * 365:
+        return "ousted"
+    return "opposition"
+
+
+def link_alignment(lk: dict, d: date, tl: list[dict] | None = None) -> str | None:
+    """What a recorded link means on date d (None outside its since / until dates)."""
+    since, until = _d(lk.get("since")), _d(lk.get("until"))
+    if (since and d < since) or (until and d > until):
+        return None
+    if lk.get("party"):
+        return party_alignment(lk["party"], d, tl)
+    legacy = {"former_govt": "ousted", "ruling": "ruling", "opposition": "opposition"}  # first-version records
+    exp = lk.get("exposure")
+    return legacy.get(exp, exp if exp in ALIGNMENTS else "other")
+
+
+def company_alignment(links: list[dict], d: date, tl: list[dict] | None = None) -> str | None:
+    """A company's political position on date d: the riskiest of its recorded links."""
+    found = {link_alignment(lk, d, tl) for lk in links} - {None}
+    return next((a for a in ALIGN_PRIORITY if a in found), None)
+
+
+def describe_link(lk: dict) -> str:
+    who = lk.get("person") or "Owner / sponsor"
+    if lk.get("party"):
+        role = ROLES.get(lk.get("role") or "", lk.get("role") or "linked")
+        return f"{who}: {role}, {PARTIES.get(lk['party'], lk['party'])}"
+    return f"{who}: {ALIGNMENTS.get(lk.get('exposure'), lk.get('exposure'))}"
+
+
 def political_links(code: str | None = None) -> list[dict]:
     sql = "SELECT * FROM political_links"
     rows = db.query(sql + (" WHERE code=%s" if code else "") + " ORDER BY code, id", (code,) if code else ())
+    tl, today = timeline(), date.today()
     for r in rows:
-        r["exposure_label"] = EXPOSURES.get(r["exposure"], r["exposure"])
+        r["party_label"] = PARTIES.get(r.get("party") or "", "")
+        r["role_label"] = ROLES.get(r.get("role") or "", r.get("role") or "")
+        r["align_now"] = link_alignment(r, today, tl)
+        r["align_label"] = ALIGNMENTS.get(r["align_now"] or "", "not active now")
+        r["exposure_label"] = describe_link(r)
     return rows
 
 
 def add_link(data: dict) -> int:
     code = str(data.get("code") or "").strip().upper()
-    exposure = str(data.get("exposure") or "")
-    if exposure not in EXPOSURES:
-        raise ValueError("Choose the kind of exposure")
+    party = str(data.get("party") or "")
+    situation = str(data.get("situation") or data.get("exposure") or "")
+    if party and party not in PARTIES:
+        raise ValueError("Unknown party")
+    if not party and situation not in SITUATIONS:
+        raise ValueError("Choose a party, or a situation without a party")
+    role = str(data.get("role") or "").strip()[:60]
+    if party and not role:
+        raise ValueError("Choose the person's role (MP, minister, relative ...)")
     source = str(data.get("source") or "").strip()
     if not source:
         raise ValueError("Add a source (newspaper, link or filing) so the record can be checked later")
-    since = data.get("since") or None
-    if since:
-        try:
-            since = date.fromisoformat(str(since))
-        except ValueError:
+    dates = {}
+    for k in ("since", "until"):
+        v = data.get(k) or None
+        if v and not _d(v):
             raise ValueError("Invalid date")
+        dates[k] = _d(v)
+    if dates["since"] and dates["until"] and dates["until"] < dates["since"]:
+        raise ValueError("'Until' is before 'since'")
     if not code or not db.scalar("SELECT COUNT(*) FROM instruments WHERE code=%s", (code,)):
         raise ValueError("Unknown trading code")
     return db.execute(
-        "INSERT INTO political_links (code, person, role, exposure, since, source, note, created_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())",
-        (code, (str(data.get("person") or "").strip() or None), (str(data.get("role") or "").strip()[:60] or None),
-         exposure, since, source[:300], (str(data.get("note") or "").strip()[:500] or None)),
+        "INSERT INTO political_links (code, person, role, party, exposure, since, until, source, note, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
+        (code, (str(data.get("person") or "").strip()[:120] or None), role or None, party or None,
+         "party" if party else situation, dates["since"], dates["until"], source[:300],
+         (str(data.get("note") or "").strip()[:500] or None)),
     )
 
 
@@ -396,17 +541,88 @@ def _political(panel: dict, market: dict, regimes: list[dict], cal: list[date],
         hi = [c for c, v in shock.items() if v["beta"] >= cut]
         groups["shock_high"] = {"label": f"Fell hardest on sell-off days (top 20%, ≥ {cut:.2f}× market)", "hindsight": True,
                                 "codes": sorted(hi), **_group_stats(hi, panel, market, uneasy)}
-    by_exp: dict[str, set] = defaultdict(set)
+    tl = timeline()
+    by_code: dict[str, list] = defaultdict(list)
     for r in political_links():
-        by_exp[r["exposure"]].add(r["code"])
-    for k, codes in by_exp.items():
-        groups["link_" + k] = {"label": "Your records: " + EXPOSURES[k], "hindsight": True,
-                               "codes": sorted(codes), **_group_stats(sorted(codes), panel, market, uneasy)}
+        by_code[r["code"]].append(r)
+    groups.update(_align_stats(by_code, panel, market, uneasy, tl))
     last = cal[-1] if cal else date.today()
     events = {c: [(d.isoformat(), t) for d, t in evs if t in POLITICAL_KINDS and (last - d).days <= max(365, active_days(t))]
               for c, evs in news_events.items()}
     return {"shock_day_pct": SHOCK_DAY * 100, "shock_days": int((market["ret"] <= SHOCK_DAY).sum()),
-            "shock": shock, "govt_hold": govt, "groups": groups, "events": {c: v for c, v in events.items() if v}}
+            "shock": shock, "govt_hold": govt, "groups": groups, "events": {c: v for c, v in events.items() if v},
+            "power_changes": _power_changes(by_code, panel, market, cal, tl), "timeline": tl}
+
+
+def _summ(v: list[float]) -> dict:
+    if len(v) < 5:
+        return {"samples": len(v)}
+    a = np.array(v)
+    return {"samples": len(v), "ex20": _r(float(np.median(a)) * 100, 2), "pos20": _r(float((a > 0).mean()) * 100, 0),
+            "p10": _r(float(np.percentile(a, 10)) * 100, 1)}
+
+
+def _align_stats(by_code: dict[str, list], panel: dict, market: dict, uneasy: set[int], tl: list[dict]) -> dict:
+    """Your recorded companies, grouped by what their link meant ON EACH DATE (ruling / ousted /
+    opposition ...), 20-session result vs the market. Chosen with hindsight: you picked them."""
+    acc: dict[str, dict] = defaultdict(lambda: {"all": [], "uneasy": [], "codes": set()})
+    for code, lks in by_code.items():
+        s = panel.get(code)
+        if not s or s["type"] != "EQ" or len(s["c"]) < 40:
+            continue
+        for t in range(20, len(s["c"]) - 20, 5):
+            cat = company_alignment(lks, s["d"][t], tl)
+            if not cat:
+                continue
+            _, ex = _fwd(s, t, 20, market)
+            if ex is None:
+                continue
+            a = acc[cat]
+            a["all"].append(ex)
+            a["codes"].add(code)
+            if int(s["di"][t]) in uneasy:
+                a["uneasy"].append(ex)
+    return {"align_" + cat: {"label": "Your records: " + ALIGNMENTS[cat], "hindsight": True, "align": cat,
+                             "companies": len(a["codes"]), "codes": sorted(a["codes"]),
+                             "all": _summ(a["all"]), "uneasy": _summ(a["uneasy"])}
+            for cat, a in acc.items()}
+
+
+def _power_changes(by_code: dict[str, list], panel: dict, market: dict, cal: list[date], tl: list[dict]) -> list[dict]:
+    """Each change of government inside the price history: how shares linked (in your records) to the
+    new ruling party, to the party that lost power and to other parties moved afterwards vs the market."""
+    out = []
+    if not cal:
+        return out
+    for per in tl:
+        c = _d(per["from"])
+        if not c or c <= cal[0] or c > cal[-1]:
+            continue
+        all_ex: dict[int, list] = {20: [], 60: []}
+        by: dict[str, dict[int, list]] = defaultdict(lambda: {20: [], 60: []})
+        for code, s in panel.items():
+            if s["type"] != "EQ":
+                continue
+            t = bisect.bisect_left(s["d"], c) - 1   # last session before the change
+            if t < 0:
+                continue
+            cat = company_alignment(by_code[code], c, tl) if code in by_code else None
+            for k in (20, 60):
+                _, ex = _fwd(s, t, k, market)
+                if ex is None:
+                    continue
+                all_ex[k].append(ex)
+                if cat:
+                    by[cat][k].append(ex)
+
+        def med(v: list) -> float | None:
+            return _r(float(np.median(v)) * 100, 2) if v else None
+
+        out.append({"date": per["from"], "label": per["label"], "party": per.get("party") or "",
+                    "all": {"n": len(all_ex[20]), "ex20": med(all_ex[20]), "ex60": med(all_ex[60])},
+                    "groups": {cat: {"label": ALIGNMENTS[cat], "n": len(v[20]), "ex20": med(v[20]), "ex60": med(v[60])}
+                               for cat, v in by.items()}})
+    return out
 
 
 def _company_static() -> tuple[dict, dict]:
@@ -596,14 +812,17 @@ def stock_view(code: str, state: dict | None = None) -> dict:
         betas = sorted(v["beta"] for v in pol["shock"].values())
         shock = {**shock, "pct_rank": _r(bisect.bisect_left(betas, shock["beta"]) / max(1, len(betas) - 1) * 100, 0)}
     links = political_links(code)
+    align = company_alignment(links, date.today()) if links else None
     groups = pol.get("groups") or {}
     mine = [{"key": k, **{x: g.get(x) for x in ("label", "companies", "all", "uneasy", "hindsight")}}
             for k, g in groups.items()
-            if code in (g.get("codes") or []) and (k.startswith("link_") or k == "state_owned")]
+            if (k == "state_owned" and code in (g.get("codes") or [])) or (align and k == "align_" + align)]
     return {"recent_events": recent[::-1], "speculation": (st.get("spec_today") or {}).get(code),
             "spec_stats": st.get("spec_stats"), "regime": st.get("regime_now"), "regime_stats": st.get("regime_stats"),
             "political": {"govt_hold": (pol.get("govt_hold") or {}).get(code), "shock": shock,
                           "shock_day_pct": pol.get("shock_day_pct"), "links": links, "groups": mine,
+                          "alignment": align, "alignment_label": ALIGNMENTS.get(align or "", None),
+                          "ruling_party": PARTIES.get(ruling_party(date.today()) or "", "no party (interim / caretaker)"),
                           "baseline": groups.get("all"),
                           "events": [ev(d, t) for d, t in (pol.get("events") or {}).get(code, [])][::-1]}}
 
@@ -616,11 +835,16 @@ def event_features(dates: list[date], events: list[tuple[date, str]]) -> dict[st
     if not events:
         return out
     ev_d = [e[0] for e in events]
-    window = max(ACTIVE_DAYS.values())
+    # write-offs stay active for years: checked on their own so the daily loop keeps a short window
+    wipe_d = [d for d, k in events if k == "wipeout"]
+    window = max(v for k, v in ACTIVE_DAYS.items() if k != "wipeout")
     for i, t in enumerate(dates):
         hi = bisect.bisect_right(ev_d, t)
         if hi == 0:
             continue
+        w = bisect.bisect_right(wipe_d, t)
+        if w and (t - wipe_d[w - 1]).days <= ACTIVE_DAYS["wipeout"]:
+            out["bd_state"][i] = 1.0
         lo = bisect.bisect_right(ev_d, t - timedelta(days=window))
         net, govt = 0, 0
         for d, kind in events[lo:hi]:
@@ -637,7 +861,7 @@ def event_features(dates: list[date], events: list[tuple[date, str]]) -> dict[st
                 out["bd_margin"][i] = 1.0
             elif kind in ("govt", "regulator") and age <= 30:
                 govt += 1
-            elif kind in ("state_control", "wipeout") and age <= ACTIVE_DAYS[kind]:
+            elif kind == "state_control" and age <= ACTIVE_DAYS[kind]:
                 out["bd_state"][i] = 1.0
             elif kind == "political_hit" and age <= ACTIVE_DAYS[kind]:
                 out["bd_polhit"][i] = 1.0

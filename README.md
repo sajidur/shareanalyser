@@ -129,6 +129,32 @@ has never seen. Code: `bdstock/predict.py`.
   can show the **50% (narrowest, default)**, 68% or 90% range. In tests the next-session 50% range was
   about 2.6% wide and held about 50% of the time, against 4.1% wide / 67% for the 68% range.
 
+### Combined prediction: everything merged (Prediction page)
+
+The forecast you see is one result built from all parts (code: `bdstock/combined.py`):
+
+```text
+shift_h  = model_h + s_h · Σ part_k(h)                 Final = P · e^(q · σ̂_h + shift_h)   (all band edges)
+
+part_k   company event   E(t+h−b) − E(t−b)   E = cumulative median effect vs the market 1, 5, 20 sessions
+                         after past events of that kind; b = the event's session; strongest event only
+         record date     same curve from the session before past record dates (the dividend drop)
+         market regime   β · (market 20-session move after this regime − average) · min(h,20)/20
+         pump risk       (risk bucket's 20-session result − all shares) · min(h,20)/20
+         state ownership (state-owned shares' result − all shares) · min(h,20)/20
+weight   every part × n/(n+20) · clip((|t|−1)/1.5, 0, 1); 0 if median and trimmed mean disagree
+model_h  statistical model − base midpoint, only while it passes its reliability gate
+s_h      0, 0.5 or 1, chosen daily on 3 unseen 15-session windows: used only if the shifted 68% range
+         is ≥ 1% better on the share-days the factors moved AND the shift pointed the right way > 50%
+```
+
+Effects are measured only from cases whose outcome was known before the forecast date. Current
+result: applied in full at 1 month (range 1.8% better, right way 62% of the time on ~2,100 affected
+share-days) and 3 months (5.3% better, right way 77%); not applied at next session and 1 week, where
+it did not help. The Prediction page shows a table with each factor's measured effect, evidence,
+weight and what it added at every horizon, then the final midpoint. Political links you record
+yourself are not added (chosen with hindsight); they are shown in the Bangladesh factors card.
+
 ### Bangladesh factors (BD factors page)
 
 Measured on DSE history every day; only effects with real evidence change the buy/sell signals.
@@ -161,11 +187,24 @@ Measured on DSE history every day; only effects with real evidence change the bu
   * Government shareholding from the DSE shareholding report (30 state-owned / state-backed companies).
   * **Fall on sell-off days:** how hard each share fell, relative to the market, on days the market
     dropped 1% or more (political and macro shocks). Shrunk towards 1 while there are few such days.
-  * **Your records:** on the BD factors page you can record a political exposure of a company's owners
-    or sponsors (linked to the former / current government, opposition, state-appointed board, owners
-    under investigation), always with a source. Records are measured as a group (marked "hindsight",
-    because you choose them knowing what happened). "Former government" and "under investigation"
-    records keep the share out of ACCUMULATE, and every plan for that share shows the record.
+  * **Your records: political links of owners, sponsors and directors.** On the BD factors page you
+    record the party (Awami League, BNP, Jamaat-e-Islami, Jatiya Party, NCP, other) and the person's
+    role (minister / adviser, MP, party leader, close relative, business partner, financier), or a
+    situation without a party (owners under investigation / asset freeze, state-appointed board),
+    with optional since / until dates and always a source. The tool never guesses anyone's party.
+  * **Who governed when:** an editable timeline (default: Awami League 6 Jan 2009 – 5 Aug 2024,
+    interim government 8 Aug 2024 – 16 Feb 2026, BNP from 17 Feb 2026; check the last period). Each
+    record's meaning follows it, date by date: *linked to the party in government*, *linked to a
+    party that lost power* (for 5 years after) or *linked to a party out of power*. The riskiest
+    record of a company decides its position. When power changes, the positions change automatically.
+  * **Measured:** each position's 20-session result vs the market (overall and in Nervous/Stress
+    markets), and how linked companies moved 20 and 60 sessions after each change of government in the
+    price history. Marked "hindsight" because you choose the companies knowing what happened.
+  * **Used:** companies linked to a party that lost power, or with owners under investigation, are kept
+    out of ACCUMULATE; every trade plan shows the record and the measured result; companies linked to
+    the party in power get a note about power-change risk. Settings → "Political records in the
+    forecast" adds the measured position effect to the combined prediction (off by default, and
+    outside the daily strength test, because of the hindsight).
   * These enter the predictor as a 5-input "political" group (government holding, takeover, court order,
     political disruption, sell-off sensitivity) and as optional inputs of the range model. Both are
     tested daily on unseen data. So far neither improves the forecasts measurably, so the daily test

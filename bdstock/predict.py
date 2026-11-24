@@ -830,19 +830,95 @@ def range_evaluate(rows: dict, horizon: int) -> dict:
     return {"method": best, "methods": methods, "bd_gain_pct": bd_gain}
 
 
+def bd_evaluate(cb, ds: dict, rows: dict, horizon: int, method: str) -> dict:
+    """Walk-forward test of the Bangladesh-factor shift on the same 3 unseen windows as the ranges.
+    The factors' effects are measured only from outcomes known before each window. The strength
+    (0, 0.5 or 1) with the lowest 68%-range interval score on the share-days they moved is used."""
+    from . import combined
+
+    codes = sorted(ds["stocks"])
+    dates = np.unique(rows["di"])
+    cols = V_ALL if "_bd" in method else V_BASE
+    acc: dict[float, dict[str, list]] = {s: defaultdict(list) for s in combined.SCALES}
+    affected = total = 0
+    for f in range(FOLDS, 0, -1):
+        if len(dates) < f * FOLD_DAYS + 20:
+            continue
+        start = dates[len(dates) - f * FOLD_DAYS]
+        end = dates[len(dates) - (f - 1) * FOLD_DAYS - 1]
+        tr = rows["ti"] < start
+        te = (rows["di"] >= start) & (rows["di"] <= end)
+        if tr.sum() < MIN_TRAIN_ROWS or te.sum() < 200:
+            continue
+        y = rows["y"][te]
+        if method == "baseline":
+            q = band_quantiles(rows["y"][tr], rows["sigma"][tr], horizon)
+            s = rows["sigma"][te] * math.sqrt(horizon)
+            q16, q50, q84 = (np.full(len(y), q[k]) for k in ("q16", "q50", "q84"))
+        else:
+            vm = VolModel().fit(rows["V"][tr][:, cols], rows["y"][tr])
+            s = vm.sigma(rows["V"][te][:, cols])
+            qs = [vm.quantiles(float(x), method.endswith("binned")) for x in s]
+            q16, q50, q84 = (np.array([qq[k] for qq in qs]) for k in ("q16", "q50", "q84"))
+        tab = cb.table(int(start))
+        idx = np.nonzero(te)[0]
+        adj = np.array([cb.total(tab, codes[int(rows["ci"][i])], int(rows["tt"][i]), horizon) for i in idx])
+        aff = np.abs(adj) >= 0.002
+        affected += int(aff.sum())
+        total += len(y)
+        yp = np.expm1(y)
+        for sc in combined.SCALES:
+            lo, hi, mid = q16 * s + sc * adj, q84 * s + sc * adj, q50 * s + sc * adj
+            lo_p, hi_p = np.expm1(lo), np.expm1(hi)
+            score = (hi_p - lo_p) + (2 / 0.32) * np.maximum(lo_p - yp, 0) + (2 / 0.32) * np.maximum(yp - hi_p, 0)
+            a = acc[sc]
+            a["score_all"].extend(score.tolist())
+            a["score"].extend(score[aff].tolist())
+            a["err"].extend(np.abs(y - mid)[aff].tolist())
+            a["in68"].extend(((y >= lo) & (y <= hi))[aff].tolist())
+            if sc == 1.0:
+                base = q50 * s
+                a["right_way"].extend((np.sign(y - base) == np.sign(adj))[aff].tolist())
+    res = {"affected": affected, "rows": total,
+           "tests": {str(sc): {k: _r(float(np.mean(v)) * 100, 2) for k, v in a.items() if v} for sc, a in acc.items()}}
+    if affected < combined.MIN_AFFECTED:
+        res.update(scale=0.0, reason=f"only {affected} share-days were moved by the factors in the test windows")
+        return res
+    # used only if the shifted range is at least 1% better AND the shift points the right way more
+    # often than not (a better score alone can be luck)
+    base = float(np.mean(acc[0.0]["score"]))
+    right = float(np.mean(acc[1.0]["right_way"])) if acc[1.0]["right_way"] else 0.0
+    better = [sc for sc in combined.SCALES if sc > 0 and float(np.mean(acc[sc]["score"])) <= base * 0.99]
+    if not better:
+        res.update(scale=0.0, reason="the factors did not improve the range by at least 1% on unseen data")
+    elif right <= 0.5:
+        res.update(scale=0.0, reason=f"the factors pointed the right way only {right * 100:.0f}% of the time")
+    else:
+        best = min(better, key=lambda sc: (float(np.mean(acc[sc]["score"])), sc))
+        res.update(scale=best, reason=f"on unseen data the factors made the range {(1 - float(np.mean(acc[best]['score'])) / base) * 100:.1f}% "
+                                      f"better and pointed the right way {right * 100:.0f}% of the time")
+    return res
+
+
 # ============================================================================ models
 
 class Model:
     """Winsorise + standardise, then ridge (expected log return) and logistic (P(up))."""
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "Model":
-        self.lo = np.nanpercentile(X, 1, axis=0)
-        self.hi = np.nanpercentile(X, 99, axis=0)
-        Xc = np.clip(X, self.lo, self.hi)
-        self.mu = Xc.mean(axis=0)
-        self.sd = Xc.std(axis=0)
-        self.sd[self.sd == 0] = 1.0
-        Z = (Xc - self.mu) / self.sd
+    @staticmethod
+    def prepare(X: np.ndarray) -> tuple:
+        """Clip limits, mean, sd and the standardised matrix. Per column, so a subset of columns
+        can reuse it (the input-group test drops one group at a time)."""
+        lo = np.nanpercentile(X, 1, axis=0)
+        hi = np.nanpercentile(X, 99, axis=0)
+        Xc = np.clip(X, lo, hi)
+        mu = Xc.mean(axis=0)
+        sd = Xc.std(axis=0)
+        sd[sd == 0] = 1.0
+        return lo, hi, mu, sd, (Xc - mu) / sd
+
+    def fit(self, X: np.ndarray | None, y: np.ndarray, prep: tuple | None = None) -> "Model":
+        self.lo, self.hi, self.mu, self.sd, Z = prep if prep is not None else self.prepare(X)
         n, d = Z.shape
         Zb = np.hstack([np.ones((n, 1)), Z])
         pen = np.eye(d + 1)
@@ -881,9 +957,11 @@ def band_quantiles(y: np.ndarray, sigma: np.ndarray, horizon: int) -> dict[str, 
     return {f"q{q}": float(v) for q, v in zip(QUANTILES, np.percentile(z, QUANTILES))}
 
 
-def _evaluate(rows: dict, horizon: int, calendar: list[date], cols: list[int] | None = None) -> dict | None:
+def _evaluate(rows: dict, horizon: int, calendar: list[date], cols: list[int] | None = None,
+              cache: dict | None = None) -> dict | None:
     """Rolling walk-forward test: for each window, fit only on data whose outcome was already
-    known before the window started, then score the window. `cols` restricts the inputs."""
+    known before the window started, then score the window. `cols` restricts the inputs;
+    `cache` keeps each window's standardised training matrix for reuse with other `cols`."""
     X = rows["X"] if cols is None else rows["X"][:, cols]
     dates = np.unique(rows["di"])
     folds = []
@@ -896,7 +974,14 @@ def _evaluate(rows: dict, horizon: int, calendar: list[date], cols: list[int] | 
         te = (rows["di"] >= start) & (rows["di"] <= end)
         if tr.sum() < MIN_TRAIN_ROWS or te.sum() < 200:
             continue
-        m = Model().fit(X[tr], rows["y"][tr])
+        if cache is not None:
+            if int(start) not in cache:
+                cache[int(start)] = Model.prepare(rows["X"][tr])
+            lo, hi, mu, sd, Z = cache[int(start)]
+            sel = slice(None) if cols is None else cols
+            m = Model().fit(None, rows["y"][tr], prep=(lo[sel], hi[sel], mu[sel], sd[sel], Z[:, sel]))
+        else:
+            m = Model().fit(X[tr], rows["y"][tr])
         q = band_quantiles(rows["y"][tr], rows["sigma"][tr], horizon)
         prob, ret = m.predict(X[te])
         y, sig = rows["y"][te], rows["sigma"][te] * math.sqrt(horizon)
@@ -944,16 +1029,18 @@ def _evaluate(rows: dict, horizon: int, calendar: list[date], cols: list[int] | 
     }
 
 
-def input_group_test(rows: dict, horizon: int, calendar: list[date], base: dict | None) -> list[dict]:
+def input_group_test(rows: dict, horizon: int, calendar: list[date], base: dict | None,
+                     cache: dict | None = None) -> list[dict]:
     """What each input group adds: re-run the walk-forward test without that group.
     Positive 'adds' = the model ranks stocks better WITH this group on unseen data."""
     if not base or base.get("rank_ic") is None:
         return []
     out = []
     all_cols = list(range(len(FEATURE_KEYS)))
+    cache = {} if cache is None else cache
     for group, idx in GROUPS.items():
         cols = [c for c in all_cols if c not in idx]
-        res = _evaluate(rows, horizon, calendar, cols)
+        res = _evaluate(rows, horizon, calendar, cols, cache)
         if not res or res.get("rank_ic") is None:
             continue
         out.append({
@@ -1023,8 +1110,9 @@ def rule_backtest(ds: dict) -> dict:
 # ============================================================================ daily run
 
 PRED_INSERT = """INSERT INTO predictions (code, trade_date, horizon, close, prob_up, exp_ret, sigma,
-    median, low30, high30, low50, high50, low68, high68, low90, high90, atr, liq_mn, hist_up, drivers, source)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+    median, low30, high30, low50, high50, low68, high68, low90, high90, atr, liq_mn, hist_up, drivers, source,
+    bd_adj, bd_detail)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
 
 
 def _hist_up(c: np.ndarray, h: int, window: int = 250) -> float | None:
@@ -1036,8 +1124,26 @@ def _hist_up(c: np.ndarray, h: int, window: int = 250) -> float | None:
     return float((r > 0).mean()) if len(r) else None
 
 
+def combine(parts: list[dict] | None, bd_total: float, scale: float, model_ret: float, base_mid: float,
+            use_model: bool, politics: float = 0.0) -> tuple[float, dict]:
+    """Final shift of the forecast (log move) = model part (only if reliable) + strength x factors
+    + your political records (only when switched on; outside the strength test)."""
+    from . import combined
+
+    model_part = model_ret - base_mid
+    shift = (model_part if use_model else 0.0) + scale * bd_total + politics
+    shift = float(np.clip(shift, -combined.MAX_SHIFT, combined.MAX_SHIFT))
+    detail = {"scale": scale, "bd_pct": round(math.expm1(bd_total) * 100, 2), "shift_pct": round(math.expm1(shift) * 100, 2),
+              "politics_pct": round(math.expm1(politics) * 100, 2),
+              "model": {"pct": round(math.expm1(model_part) * 100, 2), "used": use_model}}
+    if parts is not None:
+        detail["parts"] = combined.round_parts(parts)
+    return shift, detail
+
+
 def _predict_row(code: str, model: Model, ranger: Ranger, st: dict, t: int, h: int, day: date, source: str,
-                 explain: bool = True) -> tuple | None:
+                 explain: bool = True, bd: dict | None = None) -> tuple | None:
+    """bd: {"parts": [...] or None, "total": float, "scale": float, "use_model": bool} (Bangladesh factors)."""
     x = st["X"][t]
     if not np.isfinite(x).all():
         return None
@@ -1045,6 +1151,11 @@ def _predict_row(code: str, model: Model, ranger: Ranger, st: dict, t: int, h: i
     s, q = ranger.at(st, t)
     sigma = s / math.sqrt(h)  # stored as a per-session figure
     close = float(st["c"][t])
+    shift, detail = 0.0, None
+    if bd is not None:
+        shift, detail = combine(bd.get("parts"), bd.get("total", 0.0), bd.get("scale", 0.0), float(ret[0]),
+                                q["q50"] * s, bd.get("use_model", False), bd.get("politics", 0.0))
+        detail["base_mid"] = round(close * math.exp(q["q50"] * s), 2)
     drivers = []
     if explain:
         contrib = model.contributions(x)
@@ -1056,19 +1167,22 @@ def _predict_row(code: str, model: Model, ranger: Ranger, st: dict, t: int, h: i
     atr, liq = st["f"]["_atr"][t], st["f"]["_liq_mn"][t]
 
     def px(k: str) -> float:
-        return round(close * math.exp(q[k] * s), 2)
+        return round(close * math.exp(q[k] * s + shift), 2)
 
     return (
         code, day, h, close, round(float(prob[0]), 4), round(math.expm1(float(ret[0])) * 100, 3),
         float(sigma), px("q50"), px("q35"), px("q65"), px("q25"), px("q75"), px("q16"), px("q84"), px("q5"), px("q95"),
         float(atr) if np.isfinite(atr) else None, float(liq) if np.isfinite(liq) else None,
         _hist_up(st["c"][: t + 1], h) if explain else None, json.dumps(drivers), source,
+        shift if bd is not None else None, json.dumps(detail, default=str) if detail and explain else None,
     )
 
 
-def _long_rows(code: str, ranger: Ranger, st: dict, t: int, base_h: int, day: date) -> list[tuple]:
+def _long_rows(code: str, ranger: Ranger, st: dict, t: int, base_h: int, day: date,
+               shift: float = 0.0, detail: dict | None = None) -> list[tuple]:
     """6-month / 1-year range estimates: the base (3-month) scale grown with sqrt(time), same
-    measured shape. No direction model (prob/expected return left empty)."""
+    measured shape, moved by the 3-month Bangladesh-factor shift (factor effects are measured over
+    at most 20 sessions, so the shift does not grow further). No direction model."""
     s_base, q = ranger.at(st, t)
     close = float(st["c"][t])
     atr, liq = st["f"]["_atr"][t], st["f"]["_liq_mn"][t]
@@ -1077,13 +1191,13 @@ def _long_rows(code: str, ranger: Ranger, st: dict, t: int, base_h: int, day: da
         s = s_base * math.sqrt(lh / base_h)
 
         def px(k: str) -> float:
-            return round(close * math.exp(q[k] * s), 2)
+            return round(close * math.exp(q[k] * s + shift), 2)
 
         rows.append((
             code, day, lh, close, None, None, s / math.sqrt(lh),
             px("q50"), px("q35"), px("q65"), px("q25"), px("q75"), px("q16"), px("q84"), px("q5"), px("q95"),
             float(atr) if np.isfinite(atr) else None, float(liq) if np.isfinite(liq) else None,
-            _hist_up(st["c"][: t + 1], lh), "[]", "live",
+            _hist_up(st["c"][: t + 1], lh), "[]", "live", shift, json.dumps(detail, default=str) if detail else None,
         ))
     return rows
 
@@ -1115,13 +1229,20 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
     }
     live_codes = [c for c, st in ds["stocks"].items() if st["dates"][-1] == trade_date]
     out_rows: list[tuple] = []
+    from . import combined
+
+    cb = combined.Context(ds)
+    tab_live = cb.table(len(calendar))      # every outcome known today
+    future = next_trading_days(calendar[-1], 80)
     for h, label in HORIZONS.items():
         rows = training_rows(ds, h)
         if not rows or len(rows["y"]) < MIN_TRAIN_ROWS:
             meta["horizons"][str(h)] = {"label": label, "available": False}
             continue
-        backtest = _evaluate(rows, h, calendar)
+        prep_cache: dict = {}
+        backtest = _evaluate(rows, h, calendar, cache=prep_cache)
         ranges = range_evaluate(rows, h)
+        combo = bd_evaluate(cb, ds, rows, h, ranges["method"])
         chosen = ranges["methods"].get(ranges["method"], {})
         if backtest and chosen:
             backtest.update({f"range{lv}_hit": chosen.get(f"in{lv}") for lv in BANDS})
@@ -1133,15 +1254,24 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
             "quantiles": band_quantiles(rows["y"], rows["sigma"], h),
             "range_method": ranges["method"], "range_methods": ranges["methods"], "bd_range_gain_pct": ranges.get("bd_gain_pct"),
             "backtest": backtest, "reliable": bool(backtest and backtest["reliable"]),
-            "input_groups": input_group_test(rows, h, calendar, backtest) if group_test and h in (5, 20) else [],
+            "input_groups": input_group_test(rows, h, calendar, backtest, prep_cache) if group_test and h in (5, 20) else [],
+            "combined": combo,
         }
+        use_model = bool(backtest and backtest["reliable"])
         for code in live_codes:
             st = ds["stocks"][code]
-            row = _predict_row(code, model, ranger, st, len(st["c"]) - 1, h, trade_date, "live")
+            t = len(st["c"]) - 1
+            parts = cb.parts(tab_live, code, t, h, future)
+            total = float(sum(p["value"] for p in parts if p.get("used") and p["key"] != "politics"))
+            politics = float(sum(p["value"] for p in parts if p.get("used") and p["key"] == "politics"))
+            row = _predict_row(code, model, ranger, st, t, h, trade_date, "live",
+                               bd={"parts": parts, "total": total, "scale": combo["scale"], "use_model": use_model,
+                                   "politics": politics})
             if row:
                 out_rows.append(row)
                 if h == max(HORIZONS):
-                    out_rows.extend(_long_rows(code, ranger, st, len(st["c"]) - 1, h, trade_date))
+                    out_rows.extend(_long_rows(code, ranger, st, t, h, trade_date, shift=row[-2] or 0.0,
+                                               detail=json.loads(row[-1]) if row[-1] else None))
     for lh, label in LONG_HORIZONS.items():
         meta["horizons"][str(lh)] = {"label": label, "available": True, "extrapolated": True,
                                      "from_horizon": max(HORIZONS), "reliable": False}
@@ -1150,7 +1280,8 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
     meta["predicted"] = len({r[0] for r in out_rows})
     methods = {int(h): v.get("range_method", "baseline") for h, v in meta["horizons"].items() if v.get("available")}
     if not db.scalar("SELECT COUNT(*) FROM predictions WHERE source='backtest' AND low50 IS NOT NULL"):
-        meta["simulated"] = simulate_history(ds, methods=methods)  # first run: build a walk-forward record
+        scales = {int(h): (v.get("combined") or {}).get("scale", 0.0) for h, v in meta["horizons"].items() if v.get("available")}
+        meta["simulated"] = simulate_history(ds, methods=methods, scales=scales)  # first run: build a walk-forward record
     meta["checks"] = run_checks()
     try:
         from . import tradeplan
@@ -1169,14 +1300,19 @@ def run(trade_date: date | None = None, group_test: bool = True) -> dict:
 
 
 def simulate_history(ds: dict | None = None, days: int = 40, horizons: tuple = (1, 5, 20),
-                     methods: dict[int, str] | None = None) -> int:
+                     methods: dict[int, str] | None = None, scales: dict[int, float] | None = None) -> int:
     """Walk-forward forecasts for the last `days` sessions: each day's model is trained only on
     outcomes known before that day. Stored as source='backtest' (replaces earlier walk-forward
     rows, never touches live rows)."""
     ds = ds or build_dataset()
+    hz = meta().get("horizons", {})
     if methods is None:
-        hz = meta().get("horizons", {})
         methods = {int(h): v.get("range_method", "baseline") for h, v in hz.items() if v.get("available")}
+    if scales is None:
+        scales = {int(h): (v.get("combined") or {}).get("scale", 0.0) for h, v in hz.items() if v.get("available")}
+    from . import combined
+
+    cb = combined.Context(ds)
     db.execute("DELETE FROM predictions WHERE source='backtest'")
     db.execute("DELETE FROM prediction_checks WHERE source='backtest'")
     cal = ds["calendar"]
@@ -1196,11 +1332,14 @@ def simulate_history(ds: dict | None = None, days: int = 40, horizons: tuple = (
             model = Model().fit(rows["X"][tr], rows["y"][tr])
             sub = {k: v[tr] for k, v in rows.items()}
             ranger = Ranger(methods.get(h, "baseline"), sub, h)
+            tab = cb.table(di + 1)  # Bangladesh-factor effects known at that day's close
+            use_model = bool((hz.get(str(h)) or {}).get("reliable"))
             for code, st in ds["stocks"].items():
                 t = pos[code].get(di)
                 if t is None or t < WARMUP:
                     continue
-                row = _predict_row(code, model, ranger, st, t, h, d, "backtest", explain=False)
+                bd = {"parts": None, "total": cb.total(tab, code, t, h), "scale": scales.get(h, 0.0), "use_model": use_model}
+                row = _predict_row(code, model, ranger, st, t, h, d, "backtest", explain=False, bd=bd)
                 if row:
                     out.append(row)
     db.executemany(PRED_INSERT.replace("INSERT INTO", "INSERT IGNORE INTO"), out)
@@ -1431,6 +1570,9 @@ def forecast(code: str) -> dict | None:
             "reliable": bool(info.get("reliable")), "backtest": info.get("backtest"),
             "range_method": info.get("range_method"),
             "drivers": json.loads(r["drivers"] or "[]"),
+            # Bangladesh factors merged into this forecast: the shift applied and each factor's part
+            "bd": json.loads(r["bd_detail"]) if r.get("bd_detail") else None,
+            "combined_test": (hz.get(str(h if h not in LONG_HORIZONS else max(HORIZONS))) or {}).get("combined"),
         })
     def span(hs: tuple) -> dict | None:
         ks = [h for h in hs if h in by_h]

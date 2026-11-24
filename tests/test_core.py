@@ -530,12 +530,34 @@ class BangladeshFactorTests(unittest.TestCase):
     def test_political_link_validation(self):
         from bdstock import bdfactors as bf
 
+        with self.assertRaises(ValueError):    # neither a party nor a known situation
+            bf.add_link({"code": "GP", "situation": "guess", "source": "x"})
+        with self.assertRaises(ValueError):    # a party needs the person's role
+            bf.add_link({"code": "GP", "party": "bnp", "source": "x"})
+        with self.assertRaises(ValueError):    # a source is required
+            bf.add_link({"code": "GP", "party": "bnp", "role": "mp", "source": " "})
         with self.assertRaises(ValueError):
-            bf.add_link({"code": "GP", "exposure": "guess", "source": "x"})
-        with self.assertRaises(ValueError):  # a source is required
-            bf.add_link({"code": "GP", "exposure": "former_govt", "source": " "})
+            bf.add_link({"code": "GP", "party": "bnp", "role": "mp", "source": "paper", "since": "13/05/2026"})
         with self.assertRaises(ValueError):
-            bf.add_link({"code": "GP", "exposure": "former_govt", "source": "paper", "since": "13/05/2026"})
+            bf.add_link({"code": "GP", "party": "bnp", "role": "mp", "source": "paper", "since": "2026-05-01", "until": "2026-01-01"})
+
+    def test_political_alignment_follows_who_governs(self):
+        from bdstock import bdfactors as bf
+
+        tl = bf.DEFAULT_TIMELINE
+        al = {"party": "awami_league", "role": "mp"}
+        bnp = {"party": "bnp", "role": "minister"}
+        self.assertEqual(bf.link_alignment(al, date(2023, 5, 1), tl), "ruling")
+        self.assertEqual(bf.link_alignment(al, date(2025, 1, 1), tl), "ousted")        # lost power Aug 2024
+        self.assertEqual(bf.link_alignment(al, date(2030, 1, 1), tl), "opposition")    # more than 5 years later
+        self.assertEqual(bf.link_alignment(bnp, date(2025, 1, 1), tl), "opposition")   # interim government
+        self.assertEqual(bf.link_alignment(bnp, date(2026, 6, 1), tl), "ruling")
+        self.assertIsNone(bf.link_alignment({**bnp, "since": "2026-03-01"}, date(2026, 2, 20), tl))
+        self.assertEqual(bf.link_alignment({"exposure": "under_action"}, date(2026, 6, 1), tl), "under_action")
+        # the riskiest link decides the company's position
+        self.assertEqual(bf.company_alignment([bnp, {"exposure": "under_action"}], date(2026, 6, 1), tl), "under_action")
+        self.assertEqual(bf.company_alignment([bnp, al], date(2026, 6, 1), tl), "ousted")
+        self.assertIsNone(bf.ruling_party(date(2025, 1, 1), tl))
 
     def test_shock_beta_point_in_time(self):
         from bdstock import predict
@@ -547,6 +569,35 @@ class BangladeshFactorTests(unittest.TestCase):
         self.assertAlmostEqual(b[-1], 0.8 * 2 + 0.2)   # 40 sell-off days: weight 40/(40+10) towards the raw 2.0
         self.assertLess(b[3], b[-1])         # shrunk while there are few days
         self.assertTrue(np.all(np.diff(b[mret <= -0.01]) >= -1e-12))
+
+    def test_combined_effect_curve_and_weights(self):
+        from bdstock import combined as cb
+
+        e = {1: -0.01, 5: -0.03, 20: -0.06}
+        self.assertEqual(cb.curve(e, 0), 0.0)
+        self.assertAlmostEqual(cb.curve(e, 3), -0.02)               # halfway between 1 and 5 sessions
+        self.assertAlmostEqual(cb.curve(e, 40), -0.06)              # flat after 20 sessions
+        # an event 3 sessions ago, forecasting 5 sessions ahead: the effect between sessions 3 and 8
+        self.assertAlmostEqual(cb.curve(e, 8) - cb.curve(e, 3), (-0.03 - 0.006) + 0.02, places=6)
+        self.assertEqual(cb.weight(100, 0.8, True), 0.0)            # weak evidence counts for nothing
+        self.assertEqual(cb.weight(100, 3.0, False), 0.0)           # median and trimmed mean disagree
+        self.assertAlmostEqual(cb.weight(100, 3.0, True), 100 / 120)
+        rng = np.random.default_rng(1)
+        s = cb.summarize(rng.normal(-0.05, 0.02, 200))
+        self.assertGreater(s["w"], 0.8)
+        self.assertLess(s["eff"], -0.04)
+        self.assertEqual(cb.summarize(np.array([0.1, 0.2]))["w"], 0.0)  # too few cases
+
+    def test_combined_shift(self):
+        from bdstock import predict
+
+        shift, d = predict.combine(None, -0.04, 0.5, 0.01, 0.002, use_model=False)
+        self.assertAlmostEqual(shift, -0.02)                        # half strength, model not used
+        self.assertFalse(d["model"]["used"])
+        shift2, _ = predict.combine(None, -0.04, 1.0, 0.012, 0.002, use_model=True)
+        self.assertAlmostEqual(shift2, 0.01 - 0.04)                 # model part = its move minus the base midpoint
+        shift3, _ = predict.combine(None, -2.0, 1.0, 0.0, 0.0, use_model=False)
+        self.assertEqual(shift3, -0.30)                             # capped
 
     def test_range_model_with_bd_inputs(self):
         from bdstock import predict

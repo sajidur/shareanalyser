@@ -20,6 +20,9 @@ DEFAULTS: dict[str, str] = {
     "max_position_pct": "20",    # max % of capital in one share
     "ai_daily_minutes": "10",    # time budget for AI news scoring in the end-of-day run
     "ai_profile_minutes": "10",  # time budget for AI company health checks in the end-of-day run
+    # add your recorded political links (party / MP / minister ...) to the forecast; off by default
+    # because the companies are chosen with hindsight
+    "use_political_records": "0",
 }
 
 

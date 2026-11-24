@@ -355,12 +355,15 @@ def create_app(start_monitor: bool = False) -> Flask:
         govt = sorted((pol.get("govt_hold") or {}).items(), key=lambda kv: -kv[1])
         pol_events = sorted(((d, c, t) for c, evs in (pol.get("events") or {}).items() for d, t in evs), reverse=True)[:40]
         return jsonify(
-            political={k: pol.get(k) for k in ("shock_day_pct", "shock_days", "groups")},
+            political={k: pol.get(k) for k in ("shock_day_pct", "shock_days", "groups", "power_changes")},
             shock_top=[{"code": c, "name": names.get(c), **v} for c, v in shock],
             govt_top=[{"code": c, "name": names.get(c), "govt_hold": g, **((pol.get("shock") or {}).get(c) or {})} for c, g in govt],
             political_events=[{"date": d, "code": c, "type": t, "name": names.get(c)} for d, c, t in pol_events],
             links=[{**lk, "name": names.get(lk["code"])} for lk in bdfactors.political_links()],
-            exposures=bdfactors.EXPOSURES,
+            parties=bdfactors.PARTIES, roles=bdfactors.ROLES, alignments=bdfactors.ALIGNMENTS,
+            situations={k: bdfactors.ALIGNMENTS[k] for k in bdfactors.SITUATIONS},
+            timeline=bdfactors.timeline(),
+            ruling_now=bdfactors.PARTIES.get(bdfactors.ruling_party(date.today()) or "", "no party (interim / caretaker)"),
             built_at=st.get("built_at"), history_from=st.get("history_from"), history_to=st.get("history_to"),
             studies=st.get("studies", {}), regime_now=st.get("regime_now"), regime_stats=st.get("regime_stats", {}),
             regime_history=st.get("regime_history", []), events=st.get("events", []),
@@ -393,6 +396,15 @@ def create_app(start_monitor: bool = False) -> Flask:
             abort(400, str(e))
         JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
         return jsonify(id=new_id)
+
+    @app.post("/api/bd/timeline")
+    def bd_timeline_save():
+        try:
+            tl = bdfactors.save_timeline((_body() or {}).get("periods") or [])
+        except ValueError as e:
+            abort(400, str(e))
+        JOBS.start("bdfactors", lambda progress=None: bdfactors.build())
+        return jsonify(timeline=tl)
 
     @app.delete("/api/bd/links/<int:link_id>")
     def bd_link_delete(link_id: int):

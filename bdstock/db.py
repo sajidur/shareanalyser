@@ -272,6 +272,11 @@ MIGRATIONS = [
     ("news", "nocf_growth", "nocf_growth DOUBLE NULL AFTER eps_growth"),
     ("news", "nav_growth", "nav_growth DOUBLE NULL AFTER nocf_growth"),
     ("news", "mf_nav", "mf_nav DOUBLE NULL AFTER nav_growth"),
+    ("predictions", "bd_adj", "bd_adj DOUBLE NULL AFTER source"),
+    ("predictions", "bd_detail", "bd_detail TEXT NULL AFTER bd_adj"),
+    ("news", "bd_kinds", "bd_kinds VARCHAR(200) NULL AFTER mf_nav"),
+    ("political_links", "party", "party VARCHAR(24) NULL AFTER role"),
+    ("political_links", "until", "until DATE NULL AFTER since"),
 ]
 
 

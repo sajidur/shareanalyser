@@ -1125,11 +1125,19 @@ function horizonTile(h, close) {
   const hit = bt[`range${lvl}_hit`];
   const weak = isNum(hit) && hit < lvl - 12;
   const others = [50, 68, 90].filter(x => x !== lvl).map(x => { const [a, b] = band(h, x); return `${x}%: ${fmt(a)} – ${fmt(b)}`; }).join(' · ');
+  const bd = h.bd || {}, ct = h.combined_test || {};
+  const bdApplied = bd.scale > 0 && Math.abs(bd.shift_pct || 0) >= 0.05;
+  const bdLine = !h.bd ? ''
+    : bdApplied
+      ? `<div class="d small"><span class="${bd.shift_pct >= 0 ? 'up' : 'down'}">${arrow(bd.shift_pct)}Bangladesh factors move it ${fmtPct(bd.shift_pct, 1)}</span> <span class="muted">(base midpoint ${fmt(bd.base_mid)}; in tests the push was right ${fmt(((ct.tests || {})['1.0'] || {}).right_way, 0)}% of the time)</span></div>`
+      : Math.abs(bd.bd_pct || 0) >= 0.05
+        ? `<div class="d small muted">Bangladesh factors measured ${fmtPct(bd.bd_pct, 1)}, not applied here: ${esc(ct.reason || 'not proven at this horizon')}</div>`
+        : '<div class="d small muted">No active Bangladesh factor moves this share</div>';
   const dirLine = h.extrapolated
     ? '<span class="muted">Estimate: 3-month range extended with √time; cannot be tested with one year of history</span>'
     : h.reliable
       ? `<span class="${h.prob_up >= 0.5 ? 'up' : 'down'}">${arrow(h.prob_up - 0.5)}${pct0(h.prob_up)} chance of rising</span>`
-      : '<span class="muted">Direction: no reliable signal</span>';
+      : '<span class="muted">Statistical direction: no reliable signal</span>';
   const dateFmt = h.h >= 60 ? { day: 'numeric', month: 'short', year: 'numeric' } : { weekday: 'short', day: 'numeric', month: 'short' };
   return `<div class="tile">
     <div class="k"><span>${esc(h.label)}</span><span class="muted">${h.target_date ? fmtDate(h.target_date, dateFmt) : ''}</span></div>
@@ -1137,6 +1145,7 @@ function horizonTile(h, close) {
     <div class="d">${RANGE_NAMES[lvl]} (${lvl}%) · ${fromClose(lo, close)} to ${fromClose(hi, close)}</div>
     <div class="d small">${isNum(hit) ? `Held ${fmt(hit, 0)}% of the time in tests · ` : h.extrapolated ? '<span class="chip warn">Estimate</span> ' : ''}midpoint ${fmt(h.median)}</div>
     <div class="d small muted">${others}</div>
+    ${bdLine}
     <div class="d">${dirLine}</div>
     ${isNum(h.hist_up) ? `<div class="d muted small">Past year: higher after ${h.h === 1 ? 'one session' : esc(h.label.toLowerCase())} ${pct0(h.hist_up)} of the time</div>` : ''}
     ${weak ? `<div class="d"><span class="chip warn" title="In tests the price ended inside this ${lvl}% range only ${fmt(hit, 0)}% of the time">Low confidence</span></div>` : ''}
@@ -1149,6 +1158,46 @@ function termRow(key, title, span, hs, close) {
   return `<div class="sp" style="margin-top:4px"><h2>${title} <span class="muted small" style="font-weight:500">· ${when}</span></h2>
       <span class="small muted">${key === 'short' ? 'for trading: next session to about one month' : 'for investing: 3 months to 1 year (6-month and 1-year ranges are estimates)'}</span></div>
     <div class="tiles">${hs.map(h => horizonTile(h, close)).join('')}</div>`;
+}
+
+function combinedHtml(fc) {
+  const hs = fc.horizons.filter(h => !h.extrapolated && h.bd);
+  if (!hs.length) return '';
+  const close = fc.close;
+  // one row per factor (company events by kind), in a fixed order
+  const order = ['event', 'record', 'regime', 'spec', 'state', 'politics'];
+  const rows = new Map();
+  hs.forEach(h => (h.bd.parts || []).forEach(p => {
+    const id = p.key + (p.kind ? ':' + p.kind : '');
+    if (!rows.has(id)) rows.set(id, { p, by: {} });
+    rows.get(id).by[h.h] = p;
+  }));
+  const sorted = [...rows.values()].sort((a, b) => order.indexOf(a.p.key) - order.indexOf(b.p.key));
+  const noteShort = n => !n ? '' : n.startsWith('overlaps') ? 'overlaps a stronger event: not added' : n;
+  const cell = p => !p ? '<td class="r muted">—</td>'
+    : `<td class="r" title="Measured ${fmtPct(p.raw_pct, 2)} before the evidence weight ${isNum(p.w) ? fmt(p.w, 2) : '0'}">${p.used ? chg(p.pct, 2) : `<span class="muted">${fmtPct(p.pct, 2)}</span>`}<div class="small muted">measured ${fmtPct(p.raw_pct, 1)}</div>${p.note ? `<div class="small muted">${esc(noteShort(p.note))}</div>` : ''}</td>`;
+  const th = hs.map(h => `<th class="r">${esc(h.label)}<div class="small muted" style="font-weight:400">${h.target_date ? fmtDate(h.target_date, { day: 'numeric', month: 'short' }) : ''}</div></th>`).join('');
+  const pctOf = v => (isNum(v) && close ? (v / close - 1) * 100 : null);
+  return `<div class="card"><div class="card-h"><h2>Combined prediction: how every factor adds up</h2><span class="small muted">base model + statistical model + Bangladesh factors · each part measured on DSE history</span></div>
+    <div class="table-wrap"><table class="t"><thead><tr><th>Factor</th><th>Now</th>${th}<th>Evidence</th></tr></thead><tbody>
+      <tr><td><b>Base model</b><div class="small muted">volatility model + measured shape of DSE moves</div></td><td class="small">last close ${fmt(close)}</td>
+        ${hs.map(h => `<td class="r">${fmt(h.bd.base_mid)}<div class="small muted">${fmtPct(pctOf(h.bd.base_mid), 1)}</div></td>`).join('')}<td class="small muted">ranges held as often as promised in tests</td></tr>
+      <tr><td>Statistical model (68 inputs)</td><td class="small">${hs.some(h => h.bd.model && h.bd.model.used) ? 'passed the reliability test' : '<span class="muted">failed the reliability test: not used</span>'}</td>
+        ${hs.map(h => cell({ pct: h.bd.model ? h.bd.model.pct : 0, raw_pct: h.bd.model ? h.bd.model.pct : 0, used: h.bd.model && h.bd.model.used, w: h.bd.model && h.bd.model.used ? 1 : 0 })).join('')}<td class="small muted">gate: rank-IC, AUC, top-10</td></tr>
+      ${sorted.map(({ p, by }) => `<tr><td>${esc(p.label)}</td><td class="small wrap">${esc(p.state || '')}</td>${hs.map(h => cell(by[h.h])).join('')}
+        <td>${evBadge(p.evidence)}<div class="small muted">${isNum(p.n) ? `${fmtInt(p.n)} past cases` : ''}${isNum(p.t) ? ` · t ${fmt(p.t, 1)}` : ''}${isNum(p.w) ? ` · weight ${fmt(p.w, 2)}` : ''}</div></td></tr>`).join('')
+        || `<tr><td colspan="${hs.length + 3}" class="muted small">No active Bangladesh factor for this share right now (no recent company event, no record date ahead, normal pump risk, not state-owned).</td></tr>`}
+      <tr><td><b>Bangladesh factors total</b></td><td class="small muted">sum of the used parts</td>${hs.map(h => `<td class="r">${chg(h.bd.bd_pct, 2)}</td>`).join('')}<td></td></tr>
+      ${hs.some(h => Math.abs(h.bd.politics_pct || 0) > 0) ? `<tr><td><b>Your political records added</b></td><td class="small muted">switched on in Settings · outside the test</td>${hs.map(h => `<td class="r">${chg(h.bd.politics_pct, 2)}</td>`).join('')}<td></td></tr>` : ''}
+      <tr><td><b>Strength applied</b></td><td class="small muted">chosen daily on unseen data (Bangladesh factors)</td>${hs.map(h => { const c = h.combined_test || {}; return `<td class="r" title="${esc(c.reason || '')}"><b>${fmt((h.bd.scale || 0) * 100, 0)}%</b></td>`; }).join('')}<td></td></tr>
+      <tr class="total"><td><b>Final midpoint</b></td><td class="small muted">base × e<sup>shift</sup></td>${hs.map(h => `<td class="r"><b>${fmt(h.median)}</b><div class="small">${chg(pctOf(h.median), 1)}</div></td>`).join('')}<td></td></tr>
+    </tbody></table></div>
+    <div class="card-b small">
+      <p><b>How it is combined.</b> Final midpoint = base midpoint × e<sup>shift</sup>, where shift = statistical model (only if it passes its test) + strength × Σ Bangladesh factor parts. The whole range moves with the midpoint; its width comes from the base model. Each part is what happened to shares after the same kind of situation in the past, compared with the market (median), multiplied by an evidence weight that is 0 for weak evidence (t &lt; 1) and 1 for strong evidence with many cases.</p>
+      <ul class="steps" style="padding-left:18px">${hs.map(h => { const c = h.combined_test || {}; const t1 = (c.tests || {})['1.0'] || {}, t0 = (c.tests || {})['0.0'] || {}; return `<li><b>${esc(h.label)}:</b> strength ${fmt((h.bd.scale || 0) * 100, 0)}%. ${esc(c.reason || '')}${isNum(c.affected) ? ` · ${fmtInt(c.affected)} share-days moved by the factors in the test windows` : ''}${isNum(t0.err) && isNum(t1.err) ? ` · typical miss of the midpoint ${fmt(t0.err, 1)}% without vs ${fmt(t1.err, 1)}% with the factors` : ''}</li>`; }).join('')}</ul>
+      <p class="muted">Coloured numbers are added to the forecast; grey numbers are measured but not added (weak evidence so the weight is 0, the event falls after this horizon, or it overlaps a stronger event of the same share).
+        The 6-month and 1-year ranges use the 3-month shift (factor effects are measured over at most 20 sessions). Political records you add yourself are shown in the Bangladesh factors card but not added here, because they are chosen with hindsight.</p>
+    </div></div>`;
 }
 
 function rangeForDate(fc, iso) {
@@ -1176,6 +1225,16 @@ function formulaHtml(m) {
       <li><b>Price range</b> at confidence c (50%, 68%, 90%):<br>
         ${f('Low = P<sub>t</sub> · e<sup>q<sub>(1−c)/2</sub> · σ̂<sub>h</sub></sup>')}  ${f('High = P<sub>t</sub> · e<sup>q<sub>(1+c)/2</sub> · σ̂<sub>h</sub></sup>')}  ${f('Midpoint = P<sub>t</sub> · e<sup>q<sub>0.5</sub> · σ̂<sub>h</sub></sup>')}<br>
         e.g. the 50% range uses the 25th and 75th percentiles of z; the 90% range uses the 5th and 95th.</li>
+      <li><b>Bangladesh factors merged in (the combined prediction).</b> Every band edge is moved by one shift:<br>
+        ${f('shift<sub>h</sub> = model<sub>h</sub> + s<sub>h</sub> · Σ<sub>k</sub> part<sub>k</sub>(h)')}   ${f('Final = P<sub>t</sub> · e<sup>q · σ̂<sub>h</sub> + shift<sub>h</sub></sup>')}<br>
+        Parts, each measured only from past cases whose outcome was known before the forecast date (share vs the equal-weight market, median):
+        <b>company event</b> (DSE query, rumour, insider deal, Z downgrade/upgrade, margin ban, regulator, government, central-bank takeover, court order, political disruption, write-off, circuit day) ${f('E(t + h − b) − E(t − b)')}, E = cumulative effect 1, 5 and 20 sessions after past events of that kind (linear between, flat after 20), b = the event's session; only the strongest active event counts because events overlap.
+        <b>Record date</b>: the same curve from the session before past record dates (applied when one falls inside the horizon).
+        <b>Market regime</b>: ${f('β · (market 20-session move after days in this regime − average) · min(h, 20)/20')}.
+        <b>Pump-and-dump risk</b> and <b>state ownership</b>: ${f('(group\'s 20-session result − all shares) · min(h, 20)/20')}.<br>
+        Evidence weight on every part: ${f('w = n/(n + 20) · clip((|t| − 1)/1.5, 0, 1)')} (0 if the median and trimmed mean disagree). model<sub>h</sub> = statistical model − base midpoint, only while it passes the reliability gate.
+        Strength s<sub>h</sub> ∈ {0, 0.5, 1} is chosen daily on the same 3 unseen windows: used only if the shifted 68% range is ≥ 1% better (interval score) on the share-days the factors moved and the shift pointed the right way more than half the time.
+        Now: ${Object.entries(hz).filter(([, v]) => v.available && !v.extrapolated && v.combined).map(([, v]) => `${esc(v.label)} ${fmt((v.combined.scale || 0) * 100, 0)}%`).join(', ') || 'not tested yet'}.</li>
       <li><b>Direction</b> (shown only when it passes the test below): inputs are clipped to the 1st–99th percentile and standardised, zᵢ = (xᵢ − meanᵢ) / sdᵢ, then<br>
         ${f('P(up) = 1 / (1 + e<sup>−(w₀ + Σ wᵢ·zᵢ)</sup>)')}   (logistic regression, L2 penalty)   and   ${f('E[ln(P<sub>t+h</sub>/P<sub>t</sub>)] = β₀ + Σ βᵢ·zᵢ')}   (ridge, λ = 0.1·n)</li>
       <li><b>Reliability gate:</b> in 3 rolling unseen windows of 15 sessions, rank correlation between forecast and actual return &gt; 0.03 in every window, AUC &gt; 0.53, and the model's top 10 beat the average liquid share. Otherwise: "no reliable signal".</li>
@@ -1228,6 +1287,7 @@ function stockPredictionHtml(one) {
       <span class="small muted">A narrower range is missed more often; each tile shows how often it held in tests.</span></div>
     ${termRow('short', 'Short term', fc.date_ranges && fc.date_ranges.short, fc.horizons.filter(h => h.term === 'short'), close)}
     ${termRow('long', 'Long term', fc.date_ranges && fc.date_ranges.long, fc.horizons.filter(h => h.term === 'long'), close)}
+    ${combinedHtml(fc)}
     <div class="card"><div class="card-h"><h2>Range for a date</h2><span class="small muted">pick any trading day up to one year ahead</span></div>
       <div class="card-b toolbar"><input type="date" id="pick-date" min="${esc(fc.cone[0].time)}" max="${esc(fc.cone[fc.cone.length - 1].time)}" value="${esc(fc.cone[Math.min(9, fc.cone.length - 1)].time)}">
         <div id="pick-out" class="small" style="flex:1;min-width:260px"></div></div></div>
@@ -1666,7 +1726,6 @@ function politicalCardHtml(d) {
   const p = d.political || {};
   const groups = Object.values(p.groups || {});
   const links = d.links || [];
-  const exp = d.exposures || {};
   const evs = d.political_events || [];
   return `<div class="card"><div class="card-h"><h2>Political &amp; state influence</h2><span class="small muted">from DSE filings, shareholding and prices · plus your own records</span></div>
     <div class="card-b">
@@ -1684,22 +1743,55 @@ function politicalCardHtml(d) {
     <div class="card-b"><h3>Takeovers, court orders and political disruption in filings (last year)</h3>
       ${evs.length ? `<ul class="list-plain small" style="max-height:340px;overflow:auto">${evs.map(e => `<li class="sp"><span>${stockLink(e.code)} <span class="muted">${esc(e.name || '')}</span></span><span><span class="chip ${BD_NEG_KINDS.includes(e.type) ? 'neg' : 'warn'}">${esc(BD_KIND_LABEL[e.type] || e.type)}</span> ${fmtDate(e.date)}</span></li>`).join('')}</ul>` : '<p class="muted small">None found.</p>'}
     </div>
-    <div class="card-b"><h3>Your records: political exposure of owners and sponsors</h3>
-      <p class="small muted">Record links you know from news you trust (for example a sponsor linked to the former government, or owners under investigation), always with a source. Records are measured as a group above, and "former government" or "under investigation" records keep the share out of ACCUMULATE. They stay on this PC.</p>
-      <div class="table-wrap"><table class="t"><thead><tr><th>Code</th><th>Exposure</th><th>Person / role</th><th>Since</th><th>Source</th><th></th></tr></thead><tbody>
-        ${links.map(l => `<tr><td>${stockLink(l.code)}</td><td class="wrap">${esc(l.exposure_label)}</td><td class="wrap">${esc(l.person || '—')}${l.role ? ` <span class="muted">· ${esc(l.role)}</span>` : ''}</td><td>${l.since ? fmtDate(l.since) : '—'}</td><td class="wrap small">${/^https?:\/\//.test(l.source) ? `<a href="${esc(l.source)}" target="_blank" rel="noopener noreferrer">${esc(l.source.slice(0, 60))}</a>` : esc(l.source)}${l.note ? `<div class="muted">${esc(l.note)}</div>` : ''}</td><td><button class="x-btn" data-del-link="${l.id}" title="Delete" aria-label="Delete record">✕</button></td></tr>`).join('') || `<tr><td colspan="6">${empty('No records yet')}</td></tr>`}
+    <div class="card-b"><h3>Who governed when</h3>
+      <p class="small muted">Used to work out what each recorded link meant on each date: linked to the party in government, to a party that lost power (for 5 years), or to a party out of power. <b>Check the last period</b> and edit it if needed. Now in government: <b>${esc(d.ruling_now || '—')}</b>.</p>
+      <div class="table-wrap"><table class="t" id="tl-t"><thead><tr><th>Government</th><th>Party</th><th>From</th><th>To</th><th></th></tr></thead><tbody>
+        ${(d.timeline || []).map((t, i) => `<tr><td class="wrap">${esc(t.label)}</td><td>${esc((d.parties || {})[t.party] || 'no party')}</td><td>${fmtDate(t.from)}</td><td>${t.to ? fmtDate(t.to) : '<span class="muted">now</span>'}</td><td><button class="x-btn" data-del-period="${i}" title="Delete" aria-label="Delete period">✕</button></td></tr>`).join('')}
+      </tbody></table></div>
+      <form class="modal-b mt" id="tl-form" novalidate><div class="row">
+        <label class="field"><span>Party in government</span><select name="party"><option value="">No party (interim / caretaker)</option>${Object.entries(d.parties || {}).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label>
+        <label class="field"><span>From</span><input type="date" name="from" required></label>
+        <label class="field"><span>To (empty = now)</span><input type="date" name="to"></label>
+        <label class="field"><span>Name</span><input name="label" maxlength="80" placeholder="e.g. BNP government"></label></div>
+        <div class="sp"><div class="form-err" id="tl-err"></div><button class="btn">Add period</button></div></form>
+    </div>
+    ${powerChangesHtml(p.power_changes || [])}
+    <div class="card-b"><h3>Your records: political links of owners, sponsors and directors</h3>
+      <p class="small muted">Record what you know from news you trust, always with a source: an owner who is an MP or minister of a party, a close relative or business partner of one, a party financier, or owners under investigation. The tool never guesses anyone's party. Each record's meaning follows who governs (table above). Companies linked to a party that <b>lost power</b>, or whose owners are <b>under investigation</b>, are kept out of ACCUMULATE; all records show in the trade plan, and you can add them to the forecast in Settings. Records stay on this PC.</p>
+      <div class="table-wrap"><table class="t"><thead><tr><th>Code</th><th>Person</th><th>Role · party</th><th>Position now</th><th>Since – until</th><th>Source</th><th></th></tr></thead><tbody>
+        ${links.map(l => `<tr><td>${stockLink(l.code)}<div class="small muted">${esc(l.name || '')}</div></td><td class="wrap">${esc(l.person || '—')}</td>
+          <td class="wrap">${l.party ? `${esc(l.role_label || l.role || '')} · <b>${esc(l.party_label)}</b>` : esc((d.alignments || {})[l.exposure] || l.exposure)}</td>
+          <td class="wrap"><span class="chip ${['ousted', 'under_action'].includes(l.align_now) ? 'neg' : l.align_now === 'ruling' ? 'pos' : 'warn'}">${esc(l.align_label)}</span></td>
+          <td class="small">${l.since ? fmtDate(l.since) : '—'} – ${l.until ? fmtDate(l.until) : 'now'}</td>
+          <td class="wrap small">${/^https?:\/\//.test(l.source) ? `<a href="${esc(l.source)}" target="_blank" rel="noopener noreferrer">${esc(l.source.slice(0, 60))}</a>` : esc(l.source)}${l.note ? `<div class="muted">${esc(l.note)}</div>` : ''}</td>
+          <td><button class="x-btn" data-del-link="${l.id}" title="Delete" aria-label="Delete record">✕</button></td></tr>`).join('') || `<tr><td colspan="7">${empty('No records yet')}</td></tr>`}
       </tbody></table></div>
       <form class="modal-b mt" id="link-form" novalidate>
         <div class="row"><label class="field"><span>Trading code</span><input name="code" required placeholder="e.g. BEXIMCO" style="text-transform:uppercase"></label>
-          <label class="field"><span>Exposure</span><select name="exposure" required>${Object.entries(exp).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label></div>
-        <div class="row"><label class="field"><span>Person (optional)</span><input name="person" maxlength="120"></label>
-          <label class="field"><span>Role (optional)</span><input name="role" maxlength="60" placeholder="sponsor, chairman, director"></label>
-          <label class="field"><span>Since (optional)</span><input type="date" name="since"></label></div>
-        <div class="row"><label class="field"><span>Source (required)</span><input name="source" maxlength="300" required placeholder="newspaper + date, or a link"></label>
-          <label class="field"><span>Note</span><input name="note" maxlength="500"></label></div>
+          <label class="field"><span>Person (owner / sponsor / director)</span><input name="person" maxlength="120"></label></div>
+        <div class="row"><label class="field"><span>Party</span><select name="party"><option value="">— no party (choose a situation) —</option>${Object.entries(d.parties || {}).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label>
+          <label class="field"><span>Role</span><select name="role"><option value="">—</option>${Object.entries(d.roles || {}).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label>
+          <label class="field"><span>Or a situation without a party</span><select name="situation"><option value="">—</option>${Object.entries(d.situations || {}).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label></div>
+        <div class="row"><label class="field"><span>Since (optional)</span><input type="date" name="since"></label>
+          <label class="field"><span>Until (optional)</span><input type="date" name="until"></label>
+          <label class="field"><span>Source (required)</span><input name="source" maxlength="300" required placeholder="newspaper + date, or a link"></label></div>
+        <label class="field"><span>Note</span><input name="note" maxlength="500"></label>
         <div class="sp"><div class="form-err" id="link-err"></div><button class="btn btn-primary">Add record</button></div>
       </form>
     </div></div>`;
+}
+
+function powerChangesHtml(changes) {
+  if (!changes.length) return '';
+  return `<div class="card-b"><h3>After each change of government (inside the price history)</h3>
+    <div class="table-wrap"><table class="t"><thead><tr><th>Change</th><th>Group (your records, position after the change)</th><th class="r">Companies</th><th class="r">Next 20 sessions vs market</th><th class="r">Next 60</th></tr></thead><tbody>
+      ${changes.map(c => {
+        const gs = Object.entries(c.groups || {});
+        const rows = [['All shares', c.all], ...gs.map(([, g]) => [g.label, g])];
+        return rows.map(([lab, g], i) => `<tr>${i === 0 ? `<td rowspan="${rows.length}" class="wrap"><b>${esc(c.label)}</b><div class="small muted">${fmtDate(c.date)}</div></td>` : ''}<td class="wrap">${esc(lab)}</td><td class="r">${fmtInt(g.n)}</td><td class="r">${chg(g.ex20, 1)}</td><td class="r">${chg(g.ex60, 1)}</td></tr>`).join('');
+      }).join('')}
+    </tbody></table></div>
+    <p class="small muted">Median result of each share from the last session before the change. With few records the groups are small; add records to see how linked companies reacted when power changed.</p></div>`;
 }
 
 function politicalStockHtml(p) {
@@ -1710,7 +1802,7 @@ function politicalStockHtml(p) {
     <div class="plan-grid">
       <div class="cell"><div class="k">Government shareholding</div><div class="v">${isNum(p.govt_hold) ? fmt(p.govt_hold, 1) + '%' : 'none'}</div><div class="d">from the DSE shareholding report</div></div>
       <div class="cell"><div class="k">Fall on sell-off days</div><div class="v ${sh && sh.beta >= 1.5 ? 'down' : ''}">${sh ? fmt(sh.beta, 2) + '× market' : '—'}</div><div class="d">${sh ? `on ${sh.days} days the market fell ${fmt(Math.abs(p.shock_day_pct || 1), 0)}%+ (political / macro shocks); higher than ${fmt(sh.pct_rank, 0)}% of shares` : 'not enough trading history'}</div></div>
-      <div class="cell"><div class="k">Your political records</div><div class="v">${(p.links || []).length || 'none'}</div><div class="d">${(p.links || []).map(l => esc(l.exposure_label) + (l.person ? ` (${esc(l.person)})` : '')).join(' · ') || '<a href="#/bd">add one on the BD factors page</a>'}</div></div>
+      <div class="cell"><div class="k">Political link (your records)</div><div class="v ${['ousted', 'under_action'].includes(p.alignment) ? 'down' : ''}">${p.alignment ? esc(p.alignment_label) : 'none recorded'}</div><div class="d">${(p.links || []).map(l => esc(l.exposure_label)).join(' · ') || '<a href="#/bd">add one on the BD factors page</a>'}${p.ruling_party ? ` · in government now: ${esc(p.ruling_party)}` : ''}</div></div>
     </div>
     ${(p.groups || []).length ? `<div class="table-wrap mt"><table class="t"><thead><tr><th>Group this share is in</th><th class="r">Companies</th><th class="r">Next 20 vs market</th><th class="r">Beat market</th><th class="r">… in Nervous/Stress</th><th class="r">Beat</th></tr></thead><tbody>
       ${p.groups.map(groupRow).join('')}${base.all ? groupRow({ label: 'All shares (for comparison)', companies: base.companies, all: base.all, uneasy: base.uneasy }) : ''}</tbody></table></div>` : ''}
@@ -1817,6 +1909,24 @@ async function viewBD(el, args, ctx) {
     { key: 'govt_hold', label: 'Government', align: 'r', html: r => fmt(r.govt_hold, 1) + '%' },
     { key: 'beta', label: 'Fall on sell-offs', align: 'r', html: r => isNum(r.beta) ? fmt(r.beta, 2) + '×' : '—' },
   ], d.govt_top || [], { sort: 'govt_hold', dir: -1 }, { empty: 'No state-owned shares found' });
+  const saveTimeline = async periods => {
+    await api('/bd/timeline', { method: 'POST', body: { periods } });
+    toast('Timeline saved; political positions are being re-measured');
+    setTimeout(rerender, 3000);
+  };
+  const tf = $('#tl-form');
+  if (tf) tf.addEventListener('submit', async e => {
+    e.preventDefault();
+    try { await saveTimeline([...(d.timeline || []), Object.fromEntries(new FormData(tf).entries())]); }
+    catch (err) { $('#tl-err').textContent = err.message; }
+  });
+  const tt = $('#tl-t');
+  if (tt) tt.addEventListener('click', async e => {
+    const b = e.target.closest('[data-del-period]');
+    if (!b || !confirm('Delete this period?')) return;
+    try { await saveTimeline((d.timeline || []).filter((_, i) => i !== Number(b.dataset.delPeriod))); }
+    catch (err) { toast(err.message, 'err'); }
+  });
   const lf = $('#link-form');
   if (lf) lf.addEventListener('submit', async e => {
     e.preventDefault();
@@ -2129,6 +2239,9 @@ async function viewSettings(el, args, ctx) {
           <label class="field"><span>AI news scoring per day (minutes)</span><input type="number" step="1" min="0" name="ai_daily_minutes" value="${esc(s.ai_daily_minutes)}"></label>
         </div>
         <label class="field"><span>AI company health checks per day (minutes)</span><input type="number" step="1" min="0" name="ai_profile_minutes" value="${esc(s.ai_profile_minutes)}"></label>
+        <h3>Political records in the forecast</h3>
+        <label class="check"><input type="checkbox" name="use_political_records" ${s.use_political_records === '1' ? 'checked' : ''}> Add my recorded political links (party, MP, minister, relative …) to the combined prediction</label>
+        <p class="small muted">Off by default: you choose these companies knowing what happened to them, so their measured effect looks stronger than it will be. They always show in the trade plan. Takes effect at the next forecast update.</p>
         <h3>Notifications</h3>
         <label class="check"><input type="checkbox" name="notify_toast" ${s.notify_toast === '1' ? 'checked' : ''}> Windows desktop notifications</label>
         <label class="check"><input type="checkbox" name="notify_telegram" ${s.notify_telegram === '1' ? 'checked' : ''}> Telegram messages (to your phone)</label>

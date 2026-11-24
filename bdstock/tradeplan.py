@@ -332,14 +332,18 @@ def _plan(code: str, ctx: dict) -> dict | None:
     # political exposure the user recorded (their own research, with a source); measured as a group
     pol = bd.get("political") or {}
     links = (ctx.get("links") or {}).get(code, [])
-    pol_risky = [lk for lk in links if lk["exposure"] in bdfactors.RISKY_EXPOSURES]
+    align = bdfactors.company_alignment(links, ctx["date"] or date.today()) if links else None
+    pol_risky = align in bdfactors.RISKY_ALIGN
     pol_notes = []
-    for lk in links:
-        g = ((pol.get("groups") or {}).get("link_" + lk["exposure"]) or {}).get("all") or {}
-        who = f" ({lk['person']})" if lk.get("person") else ""
-        pol_notes.append(f"Your record: {bdfactors.EXPOSURES.get(lk['exposure'], lk['exposure'])}{who}"
-                         + (f". Shares you marked this way did {g['ex20']:+.1f}% vs the market over 20 sessions "
+    if align:
+        g = ((pol.get("groups") or {}).get("align_" + align) or {}).get("all") or {}
+        pol_notes.append(f"Your record: {'; '.join(bdfactors.describe_link(lk) for lk in links)}. Now: "
+                         f"{bdfactors.ALIGNMENTS[align].lower()}"
+                         + (f". Shares in that position did {g['ex20']:+.1f}% vs the market over 20 sessions "
                             f"(median, {g['samples']} cases; chosen with hindsight)" if g.get("ex20") is not None else ""))
+        if align == "ruling":
+            pol_notes.append("Linked to the party in power: helped while it governs, exposed when power changes "
+                             "(after August 2024 such companies faced board takeovers and asset freezes)")
     shock = (pol.get("shock") or {}).get(code)
     shock_hi = bool(shock and (shock.get("beta") or 0) >= 1.5 and regime in ("Nervous", "Stress"))
     rec_date = ctx.get("upcoming_record", {}).get(code)
@@ -495,7 +499,7 @@ def _plan(code: str, ctx: dict) -> dict | None:
         "date": ctx["date"], "close": c, "signal": signal, "reasons": reasons, "dates": dates,
         "bd": {"spec": spec, "regime": regime, "regime_fwd20": rstat.get("fwd20"), "record_date": rec_date,
                "events": bd_notes, "blocked_by": bd_block[0] if bd_block else None,
-               "political_links": [lk["exposure"] for lk in links], "shock_beta": (shock or {}).get("beta")},
+               "political_alignment": align, "shock_beta": (shock or {}).get("beta")},
         "ai_red_flag": ai_red,
         "score": score, "label": s.get("label"), "rsi": _r(rsi, 1), "long_score": long_score,
         "sigma_pct": _r(sigma * 100, 2), "atr": _r(atr), "liq_mn": _r(liq, 1),
